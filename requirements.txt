@@ -1,0 +1,6 @@
+gymnasium
+stable-baselines3[extra]>=2.0.0a5 # Usar una versión reciente para compatibilidad con Gymnasium
+numpy
+matplotlib
+pandas
+scipy
