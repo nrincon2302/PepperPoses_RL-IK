@@ -145,25 +145,24 @@ class PepperArmEnv5DOF(gym.Env):
         # Transformación al origen de RShoulderPitch (solo offset Y negativo)
         T_base_shoulder = self._get_transform(0, 'x', [0, -self.ShoulderOffsetY, 0])
 
+        # Nueva secuencia simplificada:
         # 1. RShoulderPitch (Rotación Y)
         T_sp = self._get_transform(j1, 'y')
         # 2. RShoulderRoll (Rotación Z)
         T_sr = self._get_transform(j2, 'z')
         # 3. Link UpperArm (Traslación X)
         T_l1 = self._get_transform(0, 'x', [self.UpperArmLength, 0, 0])
-        # 4. Offset Codo (Traslación Y)
-        T_eo = self._get_transform(0, 'x', [0, self.ElbowOffsetY, 0])
-        # 5. RElbowYaw (Rotación Z')
+        # 4. RElbowYaw (Rotación Z')
         T_ey = self._get_transform(j3, 'z')
-        # 6. RElbowRoll (Rotación X')
+        # 5. RElbowRoll (Rotación X')
         T_er = self._get_transform(j4, 'x')
-        # 7. Link LowerArm (Traslación X)
+        # 6. Link LowerArm (Traslación X)
         T_l2 = self._get_transform(0, 'x', [self.LowerArmLength, 0, 0])
-        # 8. RWristYaw (Rotación X'')
+        # 7. RWristYaw (Rotación X'')
         T_wy = self._get_transform(j5, 'x')
 
         # Componer transformaciones
-        T_final = T_base_shoulder @ T_sp @ T_sr @ T_l1 @ T_eo @ T_ey @ T_er @ T_l2 @ T_wy
+        T_final = T_base_shoulder @ T_sp @ T_sr @ T_l1 @ T_ey @ T_er @ T_l2 @ T_wy
 
         # La posición del efector final (origen del frame de RWristYaw) es la columna de traslación
         ee_pos = T_final[:3, 3]
