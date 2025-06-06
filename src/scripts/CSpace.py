@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from robot_graph import plot_robot, LEFT_JOINT_LIMITS, RIGHT_JOINT_LIMITS, calculate_joint_positions
+from scripts.robot_graph import plot_robot, LEFT_JOINT_LIMITS, RIGHT_JOINT_LIMITS, calculate_joint_positions
 
 
 def generate_workspace_points(side='Left', n_samples=10):
@@ -94,7 +94,6 @@ def plot_workspace():
               c='red', alpha=0.2, s=4, label='Right Arm Workspace')
     
     plt.show()
-
 
 
 if __name__ == "__main__":
