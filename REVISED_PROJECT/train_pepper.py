@@ -1,389 +1,371 @@
+# File: train_pepper.py
+
 import os
-import json
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Normal
-import gymnasium as gym
-from collections import deque
-import matplotlib.pyplot as plt
+import argparse
 from datetime import datetime
+
+import gymnasium as gym
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import optuna
+from optuna.samplers import TPESampler
+
+from stable_baselines3 import SAC, PPO
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.logger import configure
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from pepper_env import PepperArmEnv
 
-class PPONetwork(nn.Module):
-    """Red neuronal para PPO con arquitectura actor-crítico compartida."""
-    
-    def __init__(self, state_dim=11, action_dim=5, hidden_dim=256):
-        super(PPONetwork, self).__init__()
-        
-        # Capas compartidas
-        self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        
-        # Actor: política (media de distribución normal)
-        self.actor_mean = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Tanh()  # Acciones limitadas a [-1, 1], se escalan luego
-        )
-        
-        # Actor: log de desviación estándar
-        self.actor_logstd = nn.Parameter(torch.zeros(action_dim))
-        
-        # Crítico: función de valor
-        self.critic = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-        
-    def forward(self, state):
-        shared_features = self.shared(state)
-        
-        # Política
-        action_mean = self.actor_mean(shared_features) * 0.05  # Escalar a [-0.05, 0.05]
-        action_std = torch.exp(self.actor_logstd)
-        
-        # Valor
-        value = self.critic(shared_features)
-        
-        return action_mean, action_std, value
-    
-    def get_action(self, state, deterministic=False):
-        """Obtiene acción de la política."""
-        with torch.no_grad():
-            action_mean, action_std, value = self.forward(state)
-            
-            if deterministic:
-                return action_mean, value
-            
-            dist = Normal(action_mean, action_std)
-            action = dist.sample()
-            log_prob = dist.log_prob(action).sum(dim=-1)
-            
-            return action, log_prob, value
+RESULTS_DIR = "resultados_calibracion"
 
 
-class PPOBuffer:
-    """Buffer para almacenar experiencias de PPO."""
-    
-    def __init__(self, size, state_dim, action_dim, gamma=0.99, gae_lambda=0.95):
-        self.size = size
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        
-        self.states = np.zeros((size, state_dim), dtype=np.float32)
-        self.actions = np.zeros((size, action_dim), dtype=np.float32)
-        self.rewards = np.zeros(size, dtype=np.float32)
-        self.values = np.zeros(size, dtype=np.float32)
-        self.log_probs = np.zeros(size, dtype=np.float32)
-        self.dones = np.zeros(size, dtype=np.bool_)
-        
-        self.ptr = 0
-        self.path_start_idx = 0
-        
-    def store(self, state, action, reward, value, log_prob, done):
-        """Almacena una transición."""
-        assert self.ptr < self.size
-        
-        self.states[self.ptr] = state
-        self.actions[self.ptr] = action
-        self.rewards[self.ptr] = reward
-        self.values[self.ptr] = value
-        self.log_probs[self.ptr] = log_prob
-        self.dones[self.ptr] = done
-        
-        self.ptr += 1
-        
-    def finish_path(self, last_value=0):
-        """Calcula returns y ventajas usando GAE al final de un episodio."""
-        path_slice = slice(self.path_start_idx, self.ptr)
-        rewards = np.append(self.rewards[path_slice], last_value)
-        values = np.append(self.values[path_slice], last_value)
-        
-        # Calcular ventajas usando GAE
-        deltas = rewards[:-1] + self.gamma * values[1:] - values[:-1]
-        advantages = self._discount_cumsum(deltas, self.gamma * self.gae_lambda)
-        
-        # Calcular returns
-        returns = advantages + self.values[path_slice]
-        
-        # Almacenar
-        self.advantages = getattr(self, 'advantages', np.zeros(self.size, dtype=np.float32))
-        self.returns = getattr(self, 'returns', np.zeros(self.size, dtype=np.float32))
-        
-        self.advantages[path_slice] = advantages
-        self.returns[path_slice] = returns
-        
-        self.path_start_idx = self.ptr
-        
-    def get(self):
-        """Obtiene todos los datos del buffer."""
-        self.ptr, self.path_start_idx = 0, 0
-        
-        # Normalizar ventajas
-        adv_mean, adv_std = np.mean(self.advantages), np.std(self.advantages)
-        self.advantages = (self.advantages - adv_mean) / (adv_std + 1e-8)
-        
-        return (
-            torch.FloatTensor(self.states),
-            torch.FloatTensor(self.actions),
-            torch.FloatTensor(self.advantages),
-            torch.FloatTensor(self.returns),
-            torch.FloatTensor(self.log_probs)
-        )
-    
-    def _discount_cumsum(self, x, discount):
-        """Calcula suma acumulada descontada."""
-        return np.array([np.sum(discount ** np.arange(len(x[i:])) * x[i:]) for i in range(len(x))])
+class CurriculumLoggingCallback(BaseCallback):
+    """
+    Callback custom para registrar métricas específicas al final de cada episodio:
+      - episodio, recompensa total, longitud, éxito/fracaso,
+      - curriculum_radius al final, éxitos consecutivos,
+      - última posición del efector y ángulos de las articulaciones,
+      - target actual.
+    Guarda una fila en un CSV dentro de la carpeta del experimento.
+    """
+
+    def __init__(self, csv_path, verbose=0):
+        super().__init__(verbose)
+        self.csv_path = csv_path
+        # Si el CSV no existe, creamos encabezados
+        if not os.path.exists(self.csv_path):
+            df = pd.DataFrame(columns=[
+                "episode",
+                "total_reward",
+                "episode_length",
+                "is_success",
+                "curriculum_radius",
+                "consecutive_successes",
+                # Guardaremos solo la última posición y ángulos finales:
+                "final_joint_angles",  # stringified list
+                "target_pos"           # stringified list
+            ])
+            df.to_csv(self.csv_path, index=False)
+
+    def _on_step(self) -> bool:
+        # Se ejecuta cada vez que hay un 'rollout_end' y un episodio termina.
+        # Bajo Monitor, en self.locals['infos'] se encuentra un campo 'episode' cuando finaliza.
+        infos = self.locals.get("infos", None)
+        if infos is None:
+            return True
+
+        for info in infos:
+            # Cuando 'episode' aparece en info, es fin de episodio
+            if "episode" in info.keys():
+                # Extraemos datos del episodio
+                epi_data = info["episode"]
+                total_reward = epi_data["r"]
+                length = epi_data["l"]
+                # El entorno pasa is_success y curriculum_radius en cada step info,
+                # pero Monitor almacena solo al final en info["is_success"], etc.
+                is_success = info.get("is_success", False)
+                curr_rad = info.get("curriculum_radius", None)
+                consec_succ = info.get("success_consecutive", None)
+                final_angles = info.get("joint_angles", None)
+                target_pos = info.get("target_pos", None)
+
+                # Convertimos ángulos y target a string para el CSV
+                final_angles_str = np.array2string(np.array(final_angles), separator=",") if final_angles is not None else ""
+                target_pos_str = np.array2string(np.array(target_pos), separator=",") if target_pos is not None else ""
+
+                # Append a CSV
+                df_new = pd.DataFrame([{
+                    "episode": int(epi_data["r"] * 0 / 0)  # hack: se ignora porque ya tenemos r y l
+                    # Vamos a forzar episodio con len del CSV + 1
+                }])
+                # En lugar de usar epi_data["episode"], calculamos índice basado en líneas previas
+                df_all = pd.read_csv(self.csv_path)
+                next_ep = len(df_all) + 1
+
+                new_row = {
+                    "episode": next_ep,
+                    "total_reward": total_reward,
+                    "episode_length": length,
+                    "is_success": int(is_success),
+                    "curriculum_radius": float(curr_rad) if curr_rad is not None else np.nan,
+                    "consecutive_successes": int(consec_succ) if consec_succ is not None else np.nan,
+                    "final_joint_angles": final_angles_str,
+                    "target_pos": target_pos_str
+                }
+                df_all = df_all.append(new_row, ignore_index=True)
+                df_all.to_csv(self.csv_path, index=False)
+        return True
 
 
-class PPOTrainer:
-    """Entrenador PPO."""
-    
-    def __init__(self, env, config):
-        self.env = env
-        self.config = config
-        
-        # Red neuronal
-        self.network = PPONetwork(
-            state_dim=env.observation_space.shape[0],
-            action_dim=env.action_space.shape[0],
-            hidden_dim=config['hidden_dim']
-        )
-        self.optimizer = optim.Adam(self.network.parameters(), lr=config['learning_rate'])
-        
-        # Buffer
-        self.buffer = PPOBuffer(
-            size=config['steps_per_epoch'],
-            state_dim=env.observation_space.shape[0],
-            action_dim=env.action_space.shape[0],
-            gamma=config['gamma'],
-            gae_lambda=config['gae_lambda']
-        )
-        
-        # Métricas
-        self.train_rewards = []
-        self.train_values = []
-        self.eval_rewards = []
-        self.eval_values = []
-        self.episode_lengths = []
-        
-    def collect_experience(self):
-        """Recolecta experiencias usando la política actual."""
-        state, _ = self.env.reset()
-        episode_reward = 0
-        episode_length = 0
-        episode_rewards = []
-        
-        for step in range(self.config['steps_per_epoch']):
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            action, log_prob, value = self.network.get_action(state_tensor)
-            
-            action_np = action.squeeze(0).numpy()
-            next_state, reward, terminated, truncated, _ = self.env.step(action_np)
-            done = terminated or truncated
-            
-            self.buffer.store(
-                state, action_np, reward, 
-                value.item(), log_prob.item(), done
-            )
-            
-            state = next_state
-            episode_reward += reward
-            episode_length += 1
-            
-            if done:
-                self.buffer.finish_path()
-                episode_rewards.append(episode_reward)
-                self.episode_lengths.append(episode_length)
-                
-                state, _ = self.env.reset()
-                episode_reward = 0
-                episode_length = 0
-                
-        # Finalizar último episodio incompleto
-        if episode_length > 0:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            _, _, value = self.network.get_action(state_tensor)
-            self.buffer.finish_path(value.item())
-            
-        return episode_rewards
-    
-    def update_policy(self):
-        """Actualiza la política usando PPO."""
-        states, actions, advantages, returns, old_log_probs = self.buffer.get()
-        
-        policy_losses = []
-        value_losses = []
-        
-        for _ in range(self.config['train_pi_iters']):
-            # Forward pass
-            action_means, action_stds, values = self.network(states)
-            dist = Normal(action_means, action_stds)
-            log_probs = dist.log_prob(actions).sum(dim=-1)
-            
-            # Ratio de importancia
-            ratio = torch.exp(log_probs - old_log_probs)
-            
-            # Loss de política clippado
-            clip_ratio = self.config['clip_ratio']
-            clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
-            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-            
-            # Loss de valor
-            value_loss = ((values.squeeze() - returns) ** 2).mean()
-            
-            # Loss total
-            entropy = dist.entropy().sum(dim=-1).mean()
-            total_loss = policy_loss + self.config['vf_coef'] * value_loss - self.config['ent_coef'] * entropy
-            
-            # Actualización
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.config['max_grad_norm'])
-            self.optimizer.step()
-            
-            policy_losses.append(policy_loss.item())
-            value_losses.append(value_loss.item())
-            
-        return np.mean(policy_losses), np.mean(value_losses)
-    
-    def evaluate(self, n_episodes=10):
-        """Evalúa la política actual."""
-        eval_rewards = []
-        eval_values = []
-        
-        for _ in range(n_episodes):
-            state, _ = self.env.reset()
-            episode_reward = 0
-            episode_values = []
-            
-            while True:
-                state_tensor = torch.FloatTensor(state).unsqueeze(0)
-                action, value = self.network.get_action(state_tensor, deterministic=True)
-                
-                state, reward, terminated, truncated, _ = self.env.step(action.squeeze(0).numpy())
-                episode_reward += reward
-                episode_values.append(value.item())
-                
-                if terminated or truncated:
-                    break
-                    
-            eval_rewards.append(episode_reward)
-            eval_values.append(np.mean(episode_values))
-            
-        return np.mean(eval_rewards), np.mean(eval_values)
-    
-    def train(self):
-        """Bucle principal de entrenamiento."""
-        print(f"Iniciando entrenamiento PPO")
-        print(f"Configuración: {self.config}")
-        
-        for epoch in range(self.config['epochs']):
-            # Recolectar experiencias
-            episode_rewards = self.collect_experience()
-            
-            # Actualizar política
-            policy_loss, value_loss = self.update_policy()
-            
-            # Evaluación periódica
-            if epoch % self.config['eval_frequency'] == 0:
-                eval_reward, eval_value = self.evaluate()
-                self.eval_rewards.append(eval_reward)
-                self.eval_values.append(eval_value)
-                
-                print(f"Época {epoch:4d} | "
-                      f"Train R: {np.mean(episode_rewards):7.2f} | "
-                      f"Eval R: {eval_reward:7.2f} | "
-                      f"Eval V: {eval_value:7.2f} | "
-                      f"Policy Loss: {policy_loss:.4f} | "
-                      f"Value Loss: {value_loss:.4f}")
-            
-            # Guardar métricas de entrenamiento
-            if episode_rewards:
-                self.train_rewards.append(np.mean(episode_rewards))
-                # Calcular valor promedio durante entrenamiento
-                states, _, _, returns, _ = self.buffer.get()
-                train_value = returns.mean().item()
-                self.train_values.append(train_value)
-            
-            # Guardar modelo periódicamente
-            if epoch % self.config['save_frequency'] == 0:
-                self.save_model(f"models/ppo_pepper_epoch_{epoch}.pth")
-        
-        # Guardar modelo final
-        self.save_model("models/ppo_pepper_final.pth")
-        self.save_metrics()
-        
-    def save_model(self, path):
-        """Guarda el modelo."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save({
-            'network_state_dict': self.network.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': self.config
-        }, path)
-        
-    def save_metrics(self):
-        """Guarda las métricas de entrenamiento."""
-        metrics = {
-            'train_rewards': self.train_rewards,
-            'train_values': self.train_values,
-            'eval_rewards': self.eval_rewards,
-            'eval_values': self.eval_values,
-            'episode_lengths': self.episode_lengths,
-            'config': self.config
-        }
-        
-        os.makedirs("results", exist_ok=True)
-        with open("results/training_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
+def make_env(seed: int, log_folder: str, **env_kwargs):
+    """
+    Crea una instancia de PepperArmEnv, la envuelve en Monitor y fija la semilla.
+    Los resultados (Monitor) se guardan en log_folder.
+    """
+    env = PepperArmEnv(**env_kwargs)
+    env = Monitor(env, filename=os.path.join(log_folder, "monitor.csv"))
+    env.seed(seed)
+    return env
 
 
-def main():
-    # Configuración de entrenamiento
-    config = {
-        'epochs': 1000,
-        'steps_per_epoch': 4000,
-        'hidden_dim': 256,
-        'learning_rate': 3e-4,
-        'gamma': 0.99,
-        'gae_lambda': 0.95,
-        'clip_ratio': 0.2,
-        'train_pi_iters': 80,
-        'vf_coef': 0.5,
-        'ent_coef': 0.01,
-        'max_grad_norm': 0.5,
-        'eval_frequency': 10,
-        'save_frequency': 100
-    }
-    
-    # Crear entorno
-    env = PepperArmEnv(
-        side='Left',
-        render_mode=None,
-        max_steps=250,
-        n_workspace_samples=8,
-        curriculum_start_frac=0.2,
-        curriculum_increment_frac=0.1
+def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, result_folder: str):
+    """
+    Función objetivo para Optuna (PPO).
+    Trial escoge hiperparámetros; entrenamos PPO con estos y evaluamos recompensa media
+    en un conjunto de episodios de validación. Guardamos modelo y logs en result_folder.
+    """
+    # Espacio de búsqueda PPO
+    learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
+    n_steps = trial.suggest_categorical("n_steps", [128, 256, 512, 1024])
+    gamma = trial.suggest_uniform("gamma", 0.95, 0.9999)
+    gae_lambda = trial.suggest_uniform("gae_lambda", 0.8, 1.0)
+    ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
+    clip_range = trial.suggest_uniform("clip_range", 0.1, 0.3)
+    vf_coef = trial.suggest_uniform("vf_coef", 0.1, 1.0)
+
+    # Se crea carpeta para este trial
+    trial_id = trial.number + 1
+    alg_folder = os.path.join(result_folder, f"PPO-{trial_id}")
+    os.makedirs(alg_folder, exist_ok=True)
+
+    # Logger de SB3 para Tensorboard + CSV
+    new_logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
+
+    # Crear entorno de entrenamiento y de evaluación
+    train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
+    eval_env = make_env(seed=trial_id + 1000, log_folder=alg_folder, **env_kwargs)
+
+    # Callback para loguear métricas custom
+    csv_path = os.path.join(alg_folder, "curriculum_metrics.csv")
+    curriculum_cb = CurriculumLoggingCallback(csv_path=csv_path)
+
+    # EvalCallback para hacer evaluación cada cierto número de pasos
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=alg_folder,
+        log_path=os.path.join(alg_folder, "eval_logs"),
+        eval_freq=total_timesteps // 10,
+        n_eval_episodes=5,
+        deterministic=True,
+        verbose=0
     )
-    
-    # Entrenar
-    trainer = PPOTrainer(env, config)
-    trainer.train()
-    
-    print("Entrenamiento completado!")
+
+    # Crear y entrenar modelo
+    model = PPO(
+        "MlpPolicy",
+        train_env,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=64,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        ent_coef=ent_coef,
+        clip_range=clip_range,
+        vf_coef=vf_coef,
+        verbose=0,
+        tensorboard_log=os.path.join(alg_folder, "tb_logs")
+    )
+    model.set_logger(new_logger)
+
+    # Barra de progreso con Tqdm
+    total_iter = total_timesteps // 2048  # asumiendo rollout_length = n_steps
+    with tqdm(total=total_timesteps, desc=f"PPO Trial {trial_id}", unit="step") as pbar:
+        callback_list = [curriculum_cb, eval_callback]
+        # Para actualizar tqdm, usamos un callback adicional que llame a pbar.update()
+        class TqdmStepCallback(BaseCallback):
+            def __init__(self, pbar, verbose=0):
+                super().__init__(verbose)
+                self.pbar = pbar
+
+            def _on_step(self):
+                self.pbar.update(self.locals.get("n_steps", 1))
+                return True
+
+        tqdm_cb = TqdmStepCallback(pbar)
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=[tqdm_cb, *callback_list]
+        )
+
+    # Guardar modelo final
+    model.save(os.path.join(alg_folder, "final_model"))
+
+    # Evaluar rendimiento final (media de recompensa)
+    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10)
+    return mean_reward
+
+
+def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, result_folder: str):
+    """
+    Función objetivo para Optuna (SAC).
+    """
+    # Espacio de búsqueda SAC
+    learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
+    buffer_size = trial.suggest_categorical("buffer_size", [100000, 300000, 500000])
+    batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
+    tau = trial.suggest_uniform("tau", 0.005, 0.05)
+    gamma = trial.suggest_uniform("gamma", 0.95, 0.9999)
+    train_freq = trial.suggest_categorical("train_freq", [1, 2, 4, 8])
+    ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
+
+    # Se crea carpeta para este trial
+    trial_id = trial.number + 1
+    alg_folder = os.path.join(result_folder, f"SAC-{trial_id}")
+    os.makedirs(alg_folder, exist_ok=True)
+
+    # Logger
+    new_logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
+
+    # Entornos
+    train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
+    eval_env = make_env(seed=trial_id + 1000, log_folder=alg_folder, **env_kwargs)
+
+    # Callback custom
+    csv_path = os.path.join(alg_folder, "curriculum_metrics.csv")
+    curriculum_cb = CurriculumLoggingCallback(csv_path=csv_path)
+
+    # EvalCallback
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=alg_folder,
+        log_path=os.path.join(alg_folder, "eval_logs"),
+        eval_freq=total_timesteps // 10,
+        n_eval_episodes=5,
+        deterministic=True,
+        verbose=0
+    )
+
+    model = SAC(
+        "MlpPolicy",
+        train_env,
+        learning_rate=learning_rate,
+        buffer_size=buffer_size,
+        batch_size=batch_size,
+        tau=tau,
+        gamma=gamma,
+        train_freq=train_freq,
+        ent_coef=ent_coef,
+        verbose=0,
+        tensorboard_log=os.path.join(alg_folder, "tb_logs")
+    )
+    model.set_logger(new_logger)
+
+    # Barra de progreso
+    with tqdm(total=total_timesteps, desc=f"SAC Trial {trial_id}", unit="step") as pbar:
+        class TqdmStepCallback(BaseCallback):
+            def __init__(self, pbar, verbose=0):
+                super().__init__(verbose)
+                self.pbar = pbar
+
+            def _on_step(self):
+                # En SAC, cada llamada .learn() avanza train_freq pasos antes de actualizar;
+                # simplificamos asumiendo un incremento fijo por step
+                self.pbar.update(1)
+                return True
+
+        tqdm_cb = TqdmStepCallback(pbar)
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=[tqdm_cb, curriculum_cb, eval_callback]
+        )
+
+    # Guardar modelo
+    model.save(os.path.join(alg_folder, "final_model"))
+
+    # Evaluar rendimiento final
+    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10)
+    return mean_reward
+
+
+def run_hpo(alg_name: str, env_kwargs: dict, total_timesteps: int, n_trials: int):
+    """
+    Ejecuta búsqueda de hiperparámetros (Optuna) para el algoritmo elegido.
+    alg_name ∈ {'PPO', 'SAC'}.
+    Guarda resultados en carpetas bajo RESULTS_DIR.
+    """
+    if not os.path.exists(RESULTS_DIR):
+        os.makedirs(RESULTS_DIR)
+
+    study = optuna.create_study(
+        sampler=TPESampler(),
+        direction="maximize",
+        study_name=f"{alg_name}_Study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    if alg_name == "PPO":
+        objective = lambda trial: optimize_ppo(trial, env_kwargs, total_timesteps, RESULTS_DIR)
+    else:
+        objective = lambda trial: optimize_sac(trial, env_kwargs, total_timesteps, RESULTS_DIR)
+
+    study.optimize(objective, n_trials=n_trials)
+
+    # Guardar estudio
+    study.trials_dataframe().to_csv(os.path.join(RESULTS_DIR, f"{alg_name}_hpo_results.csv"))
+    print(f"\n=== HPO {alg_name} completado: mejores parámetros ===")
+    print(study.best_params)
+    print(f"Valor objetivo (recompensa media): {study.best_value:.2f}\n")
+
+
+def evaluate_policy(model, env, n_eval_episodes: int = 5):
+    """
+    Evalúa la política en env durante n_eval_episodes y retorna (mean_reward, std_reward).
+    """
+    episode_rewards = []
+    for _ in range(n_eval_episodes):
+        obs, _ = env.reset()
+        done = False
+        total_r = 0.0
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, r, terminated, truncated, info = env.step(action)
+            total_r += r
+            done = terminated or truncated
+        episode_rewards.append(total_r)
+    return np.mean(episode_rewards), np.std(episode_rewards)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Entrenamiento HPO con SB3 para PepperArmEnv")
+    parser.add_argument("--timesteps", type=int, default=500_000,
+                        help="Número total de timesteps por trial (p.ej. 500000).")
+    parser.add_argument("--trials", type=int, default=10,
+                        help="Número de trials de HPO por algoritmo.")
+    parser.add_argument("--side", type=str, default="Left", choices=["Left", "Right"],
+                        help="Brazo a entrenar: 'Left' o 'Right'.")
+    parser.add_argument("--n_samples", type=int, default=8,
+                        help="n_workspace_samples (p. ej. 8).")
+    parser.add_argument("--start_frac", type=float, default=0.2,
+                        help="Fracción inicial del currículo (p.ej. 0.2).")
+    parser.add_argument("--incr_frac", type=float, default=0.1,
+                        help="Fracción de incremento del currículo (p.ej. 0.1).")
+    parser.add_argument("--max_steps", type=int, default=250,
+                        help="Máximo de pasos por episodio.")
+    parser.add_argument("--required_succ", type=int, default=5,
+                        help="Éxitos consecutivos necesarios para subir nivel.")
+    args = parser.parse_args()
+
+    env_kwargs = {
+        "side": args.side,
+        "render_mode": None,
+        "max_steps": args.max_steps,
+        "n_workspace_samples": args.n_samples,
+        "curriculum_start_frac": args.start_frac,
+        "curriculum_increment_frac": args.incr_frac,
+        "required_consecutive_successes": args.required_succ
+    }
+
+    print("\n=== Iniciando búsqueda de hiperparámetros ===")
+    print(f"Configuración común: {env_kwargs}")
+    print(f"Timesteps por trial: {args.timesteps}, Trials: {args.trials}\n")
+
+    # 1) HPO para PPO
+    run_hpo("PPO", env_kwargs, args.timesteps, args.trials)
+
+    # 2) HPO para SAC
+    run_hpo("SAC", env_kwargs, args.timesteps, args.trials)
+
+    print("\n=== Entrenamiento y HPO completados ===\n")
