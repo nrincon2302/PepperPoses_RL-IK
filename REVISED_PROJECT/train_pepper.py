@@ -16,7 +16,6 @@ from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.logger import configure
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from pepper_env import PepperArmEnv
 
@@ -36,7 +35,7 @@ class CurriculumLoggingCallback(BaseCallback):
     def __init__(self, csv_path, verbose=0):
         super().__init__(verbose)
         self.csv_path = csv_path
-        # Si el CSV no existe, creamos encabezados
+        # Si el CSV no existe, lo creamos con encabezados
         if not os.path.exists(self.csv_path):
             df = pd.DataFrame(columns=[
                 "episode",
@@ -45,44 +44,37 @@ class CurriculumLoggingCallback(BaseCallback):
                 "is_success",
                 "curriculum_radius",
                 "consecutive_successes",
-                # Guardaremos solo la última posición y ángulos finales:
-                "final_joint_angles",  # stringified list
-                "target_pos"           # stringified list
+                "final_joint_angles",
+                "target_pos"
             ])
             df.to_csv(self.csv_path, index=False)
 
     def _on_step(self) -> bool:
-        # Se ejecuta cada vez que hay un 'rollout_end' y un episodio termina.
-        # Bajo Monitor, en self.locals['infos'] se encuentra un campo 'episode' cuando finaliza.
+        # Se ejecuta cada vez que Monitor detecta fin de episodio (info["episode"]).
         infos = self.locals.get("infos", None)
         if infos is None:
             return True
 
         for info in infos:
-            # Cuando 'episode' aparece en info, es fin de episodio
             if "episode" in info.keys():
-                # Extraemos datos del episodio
                 epi_data = info["episode"]
                 total_reward = epi_data["r"]
                 length = epi_data["l"]
-                # El entorno pasa is_success y curriculum_radius en cada step info,
-                # pero Monitor almacena solo al final en info["is_success"], etc.
                 is_success = info.get("is_success", False)
                 curr_rad = info.get("curriculum_radius", None)
                 consec_succ = info.get("success_consecutive", None)
                 final_angles = info.get("joint_angles", None)
                 target_pos = info.get("target_pos", None)
 
-                # Convertimos ángulos y target a string para el CSV
-                final_angles_str = np.array2string(np.array(final_angles), separator=",") if final_angles is not None else ""
-                target_pos_str = np.array2string(np.array(target_pos), separator=",") if target_pos is not None else ""
+                final_angles_str = (
+                    np.array2string(np.array(final_angles), separator=",")
+                    if final_angles is not None else ""
+                )
+                target_pos_str = (
+                    np.array2string(np.array(target_pos), separator=",")
+                    if target_pos is not None else ""
+                )
 
-                # Append a CSV
-                df_new = pd.DataFrame([{
-                    "episode": int(epi_data["r"] * 0 / 0)  # hack: se ignora porque ya tenemos r y l
-                    # Vamos a forzar episodio con len del CSV + 1
-                }])
-                # En lugar de usar epi_data["episode"], calculamos índice basado en líneas previas
                 df_all = pd.read_csv(self.csv_path)
                 next_ep = len(df_all) + 1
 
@@ -103,19 +95,32 @@ class CurriculumLoggingCallback(BaseCallback):
 
 def make_env(seed: int, log_folder: str, **env_kwargs):
     """
-    Crea una instancia de PepperArmEnv, la envuelve en Monitor y fija la semilla.
-    Los resultados (Monitor) se guardan en log_folder.
+    Crea una instancia de PepperArmEnv, le fija la semilla al entorno base,
+    y luego lo envuelve en Monitor para logging.
+
+    Args:
+        - seed (int): semilla para reproducibilidad.
+        - log_folder (str): carpeta donde Monitor guardará 'monitor.csv'.
+        - env_kwargs: argumentos para PepperArmEnv (side, max_steps, etc.).
+
+    Devuelve:
+        - Un entorno tipo Monitor(PepperArmEnv).
     """
-    env = PepperArmEnv(**env_kwargs)
-    env = Monitor(env, filename=os.path.join(log_folder, "monitor.csv"))
-    env.seed(seed)
+    # 1) Crear el entorno base y fijar semilla
+    env_raw = PepperArmEnv(**env_kwargs)
+    env_raw.seed(seed)
+
+    # 2) Envolverlo en Monitor para que genere 'monitor.csv'
+    monitor_path = os.path.join(log_folder, "monitor.csv")
+    os.makedirs(log_folder, exist_ok=True)
+    env = Monitor(env_raw, filename=monitor_path)
     return env
 
 
 def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, result_folder: str):
     """
     Función objetivo para Optuna (PPO).
-    Trial escoge hiperparámetros; entrenamos PPO con estos y evaluamos recompensa media
+    Trial escoge hiperparámetros, entrenamos PPO con estos y evaluamos recompensa media
     en un conjunto de episodios de validación. Guardamos modelo y logs en result_folder.
     """
     # Espacio de búsqueda PPO
@@ -127,23 +132,22 @@ def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
     clip_range = trial.suggest_uniform("clip_range", 0.1, 0.3)
     vf_coef = trial.suggest_uniform("vf_coef", 0.1, 1.0)
 
-    # Se crea carpeta para este trial
+    # Crear carpeta para este trial
     trial_id = trial.number + 1
     alg_folder = os.path.join(result_folder, f"PPO-{trial_id}")
     os.makedirs(alg_folder, exist_ok=True)
 
-    # Logger de SB3 para Tensorboard + CSV
+    # Logger de SB3 (stdout, CSV y TensorBoard)
     new_logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
 
-    # Crear entorno de entrenamiento y de evaluación
+    # Entornos de entrenamiento y evaluación
     train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
     eval_env = make_env(seed=trial_id + 1000, log_folder=alg_folder, **env_kwargs)
 
-    # Callback para loguear métricas custom
+    # Callbacks
     csv_path = os.path.join(alg_folder, "curriculum_metrics.csv")
     curriculum_cb = CurriculumLoggingCallback(csv_path=csv_path)
 
-    # EvalCallback para hacer evaluación cada cierto número de pasos
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=alg_folder,
@@ -154,7 +158,7 @@ def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
         verbose=0
     )
 
-    # Crear y entrenar modelo
+    # Crear modelo PPO con los hiperparámetros del trial
     model = PPO(
         "MlpPolicy",
         train_env,
@@ -171,24 +175,24 @@ def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
     )
     model.set_logger(new_logger)
 
-    # Barra de progreso con Tqdm
-    total_iter = total_timesteps // 2048  # asumiendo rollout_length = n_steps
+    # Barra de progreso
+    total_iter = total_timesteps // n_steps
     with tqdm(total=total_timesteps, desc=f"PPO Trial {trial_id}", unit="step") as pbar:
-        callback_list = [curriculum_cb, eval_callback]
-        # Para actualizar tqdm, usamos un callback adicional que llame a pbar.update()
         class TqdmStepCallback(BaseCallback):
             def __init__(self, pbar, verbose=0):
                 super().__init__(verbose)
                 self.pbar = pbar
+                self.n_steps = n_steps
 
             def _on_step(self):
-                self.pbar.update(self.locals.get("n_steps", 1))
+                # Actualizamos pbar en incrementos de n_steps
+                self.pbar.update(self.n_steps)
                 return True
 
         tqdm_cb = TqdmStepCallback(pbar)
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[tqdm_cb, *callback_list]
+            callback=[tqdm_cb, curriculum_cb, eval_callback]
         )
 
     # Guardar modelo final
@@ -205,14 +209,14 @@ def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
     """
     # Espacio de búsqueda SAC
     learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
-    buffer_size = trial.suggest_categorical("buffer_size", [100000, 300000, 500000])
+    buffer_size = trial.suggest_categorical("buffer_size", [100_000, 300_000, 500_000])
     batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
     tau = trial.suggest_uniform("tau", 0.005, 0.05)
     gamma = trial.suggest_uniform("gamma", 0.95, 0.9999)
     train_freq = trial.suggest_categorical("train_freq", [1, 2, 4, 8])
     ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
 
-    # Se crea carpeta para este trial
+    # Crear carpeta para este trial
     trial_id = trial.number + 1
     alg_folder = os.path.join(result_folder, f"SAC-{trial_id}")
     os.makedirs(alg_folder, exist_ok=True)
@@ -224,11 +228,9 @@ def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
     train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
     eval_env = make_env(seed=trial_id + 1000, log_folder=alg_folder, **env_kwargs)
 
-    # Callback custom
     csv_path = os.path.join(alg_folder, "curriculum_metrics.csv")
     curriculum_cb = CurriculumLoggingCallback(csv_path=csv_path)
 
-    # EvalCallback
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=alg_folder,
@@ -262,8 +264,7 @@ def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
                 self.pbar = pbar
 
             def _on_step(self):
-                # En SAC, cada llamada .learn() avanza train_freq pasos antes de actualizar;
-                # simplificamos asumiendo un incremento fijo por step
+                # Actualizamos la barra en incrementos de 1 timestep
                 self.pbar.update(1)
                 return True
 
@@ -273,10 +274,9 @@ def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
             callback=[tqdm_cb, curriculum_cb, eval_callback]
         )
 
-    # Guardar modelo
+    # Guardar modelo final
     model.save(os.path.join(alg_folder, "final_model"))
 
-    # Evaluar rendimiento final
     mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10)
     return mean_reward
 
@@ -303,7 +303,6 @@ def run_hpo(alg_name: str, env_kwargs: dict, total_timesteps: int, n_trials: int
 
     study.optimize(objective, n_trials=n_trials)
 
-    # Guardar estudio
     study.trials_dataframe().to_csv(os.path.join(RESULTS_DIR, f"{alg_name}_hpo_results.csv"))
     print(f"\n=== HPO {alg_name} completado: mejores parámetros ===")
     print(study.best_params)

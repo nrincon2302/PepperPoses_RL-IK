@@ -132,6 +132,9 @@ class PepperArmEnv(gym.Env):
         # Inicializar estado del episodio
         self._init_episode_state()
 
+    def seed(self, seed=None):
+        self.np_random, _ = gym.utils.seeding.np_random(seed)
+
     def _init_episode_state(self):
         """Variables internas que reiniciamos en cada reset()"""
         self.current_step = 0
