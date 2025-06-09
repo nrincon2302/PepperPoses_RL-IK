@@ -1,20 +1,18 @@
-# File: train_pepper.py
+# train_pepper.py
 
 import os
 import argparse
 from datetime import datetime
 
-import gymnasium as gym
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 import optuna
 from optuna.samplers import TPESampler
 
-from stable_baselines3 import SAC, PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CallbackList
 from stable_baselines3.common.logger import configure
 
 from pepper_env import PepperArmEnv
@@ -24,18 +22,17 @@ RESULTS_DIR = "resultados_calibracion"
 
 class CurriculumLoggingCallback(BaseCallback):
     """
-    Callback custom para registrar métricas específicas al final de cada episodio:
-      - episodio, recompensa total, longitud, éxito/fracaso,
-      - curriculum_radius al final, éxitos consecutivos,
-      - última posición del efector y ángulos de las articulaciones,
-      - target actual.
-    Guarda una fila en un CSV dentro de la carpeta del experimento.
+    Callback para registrar métricas de currículo al final de cada episodio.
+    Genera un CSV con columnas:
+      - episode, total_reward, episode_length, is_success,
+      - curriculum_radius, consecutive_successes,
+      - final_joint_angles, target_pos
     """
 
-    def __init__(self, csv_path, verbose=0):
+    def __init__(self, csv_path: str, verbose: int = 0):
         super().__init__(verbose)
         self.csv_path = csv_path
-        # Si el CSV no existe, lo creamos con encabezados
+        # Si no existe, creamos el CSV con cabeceras
         if not os.path.exists(self.csv_path):
             df = pd.DataFrame(columns=[
                 "episode",
@@ -50,81 +47,79 @@ class CurriculumLoggingCallback(BaseCallback):
             df.to_csv(self.csv_path, index=False)
 
     def _on_step(self) -> bool:
-        # Se ejecuta cada vez que Monitor detecta fin de episodio (info["episode"]).
-        infos = self.locals.get("infos", None)
-        if infos is None:
+        infos = self.locals.get("infos", [])
+        if not infos:
             return True
 
+        # Leemos el CSV existente
+        df_all = pd.read_csv(self.csv_path)
+
         for info in infos:
-            if "episode" in info.keys():
-                epi_data = info["episode"]
-                total_reward = epi_data["r"]
-                length = epi_data["l"]
+            if "episode" in info:
+                epi = info["episode"]
+                total_reward = epi["r"]
+                length = epi["l"]
                 is_success = info.get("is_success", False)
-                curr_rad = info.get("curriculum_radius", None)
-                consec_succ = info.get("success_consecutive", None)
-                final_angles = info.get("joint_angles", None)
-                target_pos = info.get("target_pos", None)
+                curr_rad = info.get("curriculum_radius", np.nan)
+                consec = info.get("success_consecutive", np.nan)
+                angles = info.get("joint_angles", [])
+                target = info.get("target_pos", [])
 
-                final_angles_str = (
-                    np.array2string(np.array(final_angles), separator=",")
-                    if final_angles is not None else ""
-                )
-                target_pos_str = (
-                    np.array2string(np.array(target_pos), separator=",")
-                    if target_pos is not None else ""
-                )
-
-                df_all = pd.read_csv(self.csv_path)
-                next_ep = len(df_all) + 1
+                angles_str = np.array2string(np.array(angles), separator=",")
+                target_str = np.array2string(np.array(target), separator=",")
 
                 new_row = {
-                    "episode": next_ep,
+                    "episode": len(df_all) + 1,
                     "total_reward": total_reward,
                     "episode_length": length,
                     "is_success": int(is_success),
-                    "curriculum_radius": float(curr_rad) if curr_rad is not None else np.nan,
-                    "consecutive_successes": int(consec_succ) if consec_succ is not None else np.nan,
-                    "final_joint_angles": final_angles_str,
-                    "target_pos": target_pos_str
+                    "curriculum_radius": float(curr_rad),
+                    "consecutive_successes": int(consec),
+                    "final_joint_angles": angles_str,
+                    "target_pos": target_str
                 }
-                df_all = df_all.append(new_row, ignore_index=True)
-                df_all.to_csv(self.csv_path, index=False)
+                df_all = pd.concat([df_all, pd.DataFrame([new_row])], ignore_index=True)
+
+        df_all.to_csv(self.csv_path, index=False)
         return True
 
 
 def make_env(seed: int, log_folder: str, **env_kwargs):
     """
-    Crea una instancia de PepperArmEnv, le fija la semilla al entorno base,
-    y luego lo envuelve en Monitor para logging.
-
-    Args:
-        - seed (int): semilla para reproducibilidad.
-        - log_folder (str): carpeta donde Monitor guardará 'monitor.csv'.
-        - env_kwargs: argumentos para PepperArmEnv (side, max_steps, etc.).
-
-    Devuelve:
-        - Un entorno tipo Monitor(PepperArmEnv).
+    Crea un PepperArmEnv y lo envuelve en Monitor.
+    Fija la semilla ANTES de envolverlo.
     """
-    # 1) Crear el entorno base y fijar semilla
+    os.makedirs(log_folder, exist_ok=True)
     env_raw = PepperArmEnv(**env_kwargs)
     env_raw.seed(seed)
-
-    # 2) Envolverlo en Monitor para que genere 'monitor.csv'
     monitor_path = os.path.join(log_folder, "monitor.csv")
-    os.makedirs(log_folder, exist_ok=True)
-    env = Monitor(env_raw, filename=monitor_path)
-    return env
+    return Monitor(env_raw, filename=monitor_path)
 
 
-def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, result_folder: str):
+def evaluate_policy(model, env, n_eval_episodes: int = 5):
     """
-    Función objetivo para Optuna (PPO).
-    Trial escoge hiperparámetros, entrenamos PPO con estos y evaluamos recompensa media
-    en un conjunto de episodios de validación. Guardamos modelo y logs en result_folder.
+    Ejecuta la política determinística durante n_eval_episodes y devuelve (mean_reward, std_reward).
     """
-    # Espacio de búsqueda PPO
-    learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
+    rewards = []
+    for _ in range(n_eval_episodes):
+        obs, _ = env.reset()
+        done = False
+        total_r = 0.0
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, r, terminated, truncated, _ = env.step(action)
+            total_r += r
+            done = terminated or truncated
+        rewards.append(total_r)
+    return np.mean(rewards), np.std(rewards)
+
+
+def optimize_ppo(trial: optuna.Trial, env_kwargs, total_timesteps: int, base_dir: str):
+    """
+    Función objetivo PPO para Optuna.
+    """
+    # Espacio de búsqueda
+    lr = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
     n_steps = trial.suggest_categorical("n_steps", [128, 256, 512, 1024])
     gamma = trial.suggest_uniform("gamma", 0.95, 0.9999)
     gae_lambda = trial.suggest_uniform("gae_lambda", 0.8, 1.0)
@@ -132,37 +127,35 @@ def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
     clip_range = trial.suggest_uniform("clip_range", 0.1, 0.3)
     vf_coef = trial.suggest_uniform("vf_coef", 0.1, 1.0)
 
-    # Crear carpeta para este trial
+    # Carpeta de este trial
     trial_id = trial.number + 1
-    alg_folder = os.path.join(result_folder, f"PPO-{trial_id}")
+    alg_folder = os.path.join(base_dir, f"PPO-{trial_id}")
     os.makedirs(alg_folder, exist_ok=True)
 
-    # Logger de SB3 (stdout, CSV y TensorBoard)
-    new_logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
+    # Logger de SB3
+    logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
 
-    # Entornos de entrenamiento y evaluación
+    # Entorno de entrenamiento y evaluación
     train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
-    eval_env = make_env(seed=trial_id + 1000, log_folder=alg_folder, **env_kwargs)
+    eval_env = make_env(seed=trial_id + 1000, log_folder=os.path.join(alg_folder, "eval"), **env_kwargs)
 
     # Callbacks
-    csv_path = os.path.join(alg_folder, "curriculum_metrics.csv")
-    curriculum_cb = CurriculumLoggingCallback(csv_path=csv_path)
-
-    eval_callback = EvalCallback(
+    curriculum_cb = CurriculumLoggingCallback(csv_path=os.path.join(alg_folder, "curriculum_metrics.csv"))
+    eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=alg_folder,
         log_path=os.path.join(alg_folder, "eval_logs"),
-        eval_freq=total_timesteps // 10,
+        eval_freq=max(1, total_timesteps // 10),
         n_eval_episodes=5,
         deterministic=True,
         verbose=0
     )
 
-    # Crear modelo PPO con los hiperparámetros del trial
+    # Crear modelo PPO
     model = PPO(
         "MlpPolicy",
         train_env,
-        learning_rate=learning_rate,
+        learning_rate=lr,
         n_steps=n_steps,
         batch_size=64,
         gamma=gamma,
@@ -173,42 +166,29 @@ def optimize_ppo(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
         verbose=0,
         tensorboard_log=os.path.join(alg_folder, "tb_logs")
     )
-    model.set_logger(new_logger)
+    model.set_logger(logger)
 
-    # Barra de progreso
-    total_iter = total_timesteps // n_steps
-    with tqdm(total=total_timesteps, desc=f"PPO Trial {trial_id}", unit="step") as pbar:
-        class TqdmStepCallback(BaseCallback):
-            def __init__(self, pbar, verbose=0):
-                super().__init__(verbose)
-                self.pbar = pbar
-                self.n_steps = n_steps
-
-            def _on_step(self):
-                # Actualizamos pbar en incrementos de n_steps
-                self.pbar.update(self.n_steps)
-                return True
-
-        tqdm_cb = TqdmStepCallback(pbar)
-        model.learn(
-            total_timesteps=total_timesteps,
-            callback=[tqdm_cb, curriculum_cb, eval_callback]
-        )
+    # Entrenar con barra de progreso integrada
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=CallbackList([curriculum_cb, eval_cb]),
+        progress_bar=True
+    )
 
     # Guardar modelo final
     model.save(os.path.join(alg_folder, "final_model"))
 
-    # Evaluar rendimiento final (media de recompensa)
+    # Evaluar recompensa media final
     mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10)
     return mean_reward
 
 
-def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, result_folder: str):
+def optimize_sac(trial: optuna.Trial, env_kwargs, total_timesteps: int, base_dir: str):
     """
-    Función objetivo para Optuna (SAC).
+    Función objetivo SAC para Optuna.
     """
-    # Espacio de búsqueda SAC
-    learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
+    # Espacio de búsqueda
+    lr = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
     buffer_size = trial.suggest_categorical("buffer_size", [100_000, 300_000, 500_000])
     batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
     tau = trial.suggest_uniform("tau", 0.005, 0.05)
@@ -216,35 +196,35 @@ def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
     train_freq = trial.suggest_categorical("train_freq", [1, 2, 4, 8])
     ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
 
-    # Crear carpeta para este trial
+    # Carpeta de este trial
     trial_id = trial.number + 1
-    alg_folder = os.path.join(result_folder, f"SAC-{trial_id}")
+    alg_folder = os.path.join(base_dir, f"SAC-{trial_id}")
     os.makedirs(alg_folder, exist_ok=True)
 
     # Logger
-    new_logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
+    logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
 
     # Entornos
     train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
-    eval_env = make_env(seed=trial_id + 1000, log_folder=alg_folder, **env_kwargs)
+    eval_env = make_env(seed=trial_id + 1000, log_folder=os.path.join(alg_folder, "eval"), **env_kwargs)
 
-    csv_path = os.path.join(alg_folder, "curriculum_metrics.csv")
-    curriculum_cb = CurriculumLoggingCallback(csv_path=csv_path)
-
-    eval_callback = EvalCallback(
+    # Callbacks
+    curriculum_cb = CurriculumLoggingCallback(csv_path=os.path.join(alg_folder, "curriculum_metrics.csv"))
+    eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=alg_folder,
         log_path=os.path.join(alg_folder, "eval_logs"),
-        eval_freq=total_timesteps // 10,
+        eval_freq=max(1, total_timesteps // 10),
         n_eval_episodes=5,
         deterministic=True,
         verbose=0
     )
 
+    # Crear modelo SAC
     model = SAC(
         "MlpPolicy",
         train_env,
-        learning_rate=learning_rate,
+        learning_rate=lr,
         buffer_size=buffer_size,
         batch_size=batch_size,
         tau=tau,
@@ -254,97 +234,68 @@ def optimize_sac(trial: optuna.trial.Trial, env_kwargs, total_timesteps: int, re
         verbose=0,
         tensorboard_log=os.path.join(alg_folder, "tb_logs")
     )
-    model.set_logger(new_logger)
+    model.set_logger(logger)
 
-    # Barra de progreso
-    with tqdm(total=total_timesteps, desc=f"SAC Trial {trial_id}", unit="step") as pbar:
-        class TqdmStepCallback(BaseCallback):
-            def __init__(self, pbar, verbose=0):
-                super().__init__(verbose)
-                self.pbar = pbar
-
-            def _on_step(self):
-                # Actualizamos la barra en incrementos de 1 timestep
-                self.pbar.update(1)
-                return True
-
-        tqdm_cb = TqdmStepCallback(pbar)
-        model.learn(
-            total_timesteps=total_timesteps,
-            callback=[tqdm_cb, curriculum_cb, eval_callback]
-        )
+    # Entrenar con barra de progreso integrada
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=CallbackList([curriculum_cb, eval_cb]),
+        progress_bar=True
+    )
 
     # Guardar modelo final
     model.save(os.path.join(alg_folder, "final_model"))
 
+    # Evaluar recompensa media final
     mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10)
     return mean_reward
 
 
 def run_hpo(alg_name: str, env_kwargs: dict, total_timesteps: int, n_trials: int):
     """
-    Ejecuta búsqueda de hiperparámetros (Optuna) para el algoritmo elegido.
-    alg_name ∈ {'PPO', 'SAC'}.
-    Guarda resultados en carpetas bajo RESULTS_DIR.
+    Ejecuta HPO con Optuna para 'PPO' o 'SAC'.
     """
-    if not os.path.exists(RESULTS_DIR):
-        os.makedirs(RESULTS_DIR)
-
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     study = optuna.create_study(
         sampler=TPESampler(),
         direction="maximize",
-        study_name=f"{alg_name}_Study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        study_name=f"{alg_name}_Study_{datetime.now():%Y%m%d_%H%M%S}"
     )
 
     if alg_name == "PPO":
-        objective = lambda trial: optimize_ppo(trial, env_kwargs, total_timesteps, RESULTS_DIR)
+        func = lambda trial: optimize_ppo(trial, env_kwargs, total_timesteps, RESULTS_DIR)
     else:
-        objective = lambda trial: optimize_sac(trial, env_kwargs, total_timesteps, RESULTS_DIR)
+        func = lambda trial: optimize_sac(trial, env_kwargs, total_timesteps, RESULTS_DIR)
 
-    study.optimize(objective, n_trials=n_trials)
+    study.optimize(func, n_trials=n_trials)
 
-    study.trials_dataframe().to_csv(os.path.join(RESULTS_DIR, f"{alg_name}_hpo_results.csv"))
-    print(f"\n=== HPO {alg_name} completado: mejores parámetros ===")
-    print(study.best_params)
-    print(f"Valor objetivo (recompensa media): {study.best_value:.2f}\n")
+    # Guardar resultados del estudio
+    df = study.trials_dataframe()
+    df.to_csv(os.path.join(RESULTS_DIR, f"{alg_name}_hpo_results.csv"), index=False)
 
-
-def evaluate_policy(model, env, n_eval_episodes: int = 5):
-    """
-    Evalúa la política en env durante n_eval_episodes y retorna (mean_reward, std_reward).
-    """
-    episode_rewards = []
-    for _ in range(n_eval_episodes):
-        obs, _ = env.reset()
-        done = False
-        total_r = 0.0
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, r, terminated, truncated, info = env.step(action)
-            total_r += r
-            done = terminated or truncated
-        episode_rewards.append(total_r)
-    return np.mean(episode_rewards), np.std(episode_rewards)
+    print(f"\n=== HPO {alg_name} completado ===")
+    print("Mejores parámetros:", study.best_params)
+    print(f"Recompensa media objetivo: {study.best_value:.2f}\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Entrenamiento HPO con SB3 para PepperArmEnv")
     parser.add_argument("--timesteps", type=int, default=500_000,
-                        help="Número total de timesteps por trial (p.ej. 500000).")
+                        help="Timesteps por trial")
     parser.add_argument("--trials", type=int, default=10,
-                        help="Número de trials de HPO por algoritmo.")
-    parser.add_argument("--side", type=str, default="Left", choices=["Left", "Right"],
-                        help="Brazo a entrenar: 'Left' o 'Right'.")
+                        help="Trials de HPO por algoritmo")
+    parser.add_argument("--side", choices=["Left", "Right"], default="Left",
+                        help="Brazo a entrenar")
     parser.add_argument("--n_samples", type=int, default=8,
-                        help="n_workspace_samples (p. ej. 8).")
+                        help="Muestras por dimensión en CSpace")
     parser.add_argument("--start_frac", type=float, default=0.2,
-                        help="Fracción inicial del currículo (p.ej. 0.2).")
+                        help="Frac. inicial del currículo")
     parser.add_argument("--incr_frac", type=float, default=0.1,
-                        help="Fracción de incremento del currículo (p.ej. 0.1).")
+                        help="Frac. de incremento del currículo")
     parser.add_argument("--max_steps", type=int, default=250,
-                        help="Máximo de pasos por episodio.")
+                        help="Máx. pasos por episodio")
     parser.add_argument("--required_succ", type=int, default=5,
-                        help="Éxitos consecutivos necesarios para subir nivel.")
+                        help="Éxitos consecutivos para subir nivel")
     args = parser.parse_args()
 
     env_kwargs = {
@@ -357,14 +308,11 @@ if __name__ == "__main__":
         "required_consecutive_successes": args.required_succ
     }
 
-    print("\n=== Iniciando búsqueda de hiperparámetros ===")
-    print(f"Configuración común: {env_kwargs}")
-    print(f"Timesteps por trial: {args.timesteps}, Trials: {args.trials}\n")
+    print("\n=== Iniciando HPO ===")
+    print(f"Configuración de entorno: {env_kwargs}")
+    print(f"Timesteps: {args.timesteps}, Trials: {args.trials}\n")
 
-    # 1) HPO para PPO
-    run_hpo("PPO", env_kwargs, args.timesteps, args.trials)
-
-    # 2) HPO para SAC
+    #run_hpo("PPO", env_kwargs, args.timesteps, args.trials)
     run_hpo("SAC", env_kwargs, args.timesteps, args.trials)
 
-    print("\n=== Entrenamiento y HPO completados ===\n")
+    print("=== Entrenamiento y HPO completados ===")
