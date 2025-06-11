@@ -315,10 +315,10 @@ Al iniciar, el script muestra en pantalla los valores de `env_kwargs` y comienza
         - `gae_lambda`: Uniform(0.8,1.0)  
         - `ent_coef`: LogUniform(1e-8,1e-2)  
         - `clip_range`: Uniform(0.1,0.3)  
-        - `vf_coef`: Uniform(0.1,1.0)                                                                                                           |
+        - `vf_coef`: Uniform(0.1,1.0)                                                                                                        |
 
 
-\| **SAC**   | - `learning_rate`: LogUniform(1e-5,1e-3)
+| **SAC**   | - `learning_rate`: LogUniform(1e-5,1e-3)
 \- `buffer_size`: Categorical(\[100000,300000,500000])
 \- `batch_size`: Categorical(\[64,128,256])
 \- `tau`: Uniform(0.005,0.05)
