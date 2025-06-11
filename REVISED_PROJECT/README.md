@@ -307,15 +307,11 @@ Al iniciar, el script muestra en pantalla los valores de `env_kwargs` y comienza
 
 ### 5.3 HPO con Optuna para PPO y SAC
 
-| Algoritmo | Hiperparámetros a buscar (Espacio de Búsqueda) |
-| --------- | ---------------------------------------------- |
-| **SAC**   | - `learning_rate`: LogUniform(1e-5,1e-3) <br>
-- `buffer_size`: Categorical(\[100000,300000,500000])<br>
-- `batch_size`: Categorical(\[64,128,256]) <br>
-- `tau`: Uniform(0.005,0.05) <br>
-- `gamma`: Uniform(0.95,0.9999) <br>
-- `train_freq`: Categorical(\[1,2,4,8]) <br>
-- `ent_coef`: LogUniform(1e-8,1e-2)  |
+| Algoritmo | Hiperparámetros a buscar (Espacio de Búsqueda)                                                                                                                                                                                                                                                                                                                                                                                      |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **PPO**   | <ul><li><code>learning\_rate</code>: LogUniform(1e-5, 1e-3)</li><li><code>n\_steps</code>: Categorical(\[128, 256, 512, 1024])</li><li><code>gamma</code>: Uniform(0.95, 0.9999)</li><li><code>gae\_lambda</code>: Uniform(0.8, 1.0)</li><li><code>ent\_coef</code>: LogUniform(1e-8, 1e-2)</li><li><code>clip\_range</code>: Uniform(0.1, 0.3)</li><li><code>vf\_coef</code>: Uniform(0.1, 1.0)</li></ul>                          |
+| **SAC**   | <ul><li><code>learning\_rate</code>: LogUniform(1e-5, 1e-3)</li><li><code>buffer\_size</code>: Categorical(\[100000, 300000, 500000])</li><li><code>batch\_size</code>: Categorical(\[64, 128, 256])</li><li><code>tau</code>: Uniform(0.005, 0.05)</li><li><code>gamma</code>: Uniform(0.95, 0.9999)</li><li><code>train\_freq</code>: Categorical(\[1, 2, 4, 8])</li><li><code>ent\_coef</code>: LogUniform(1e-8, 1e-2)</li></ul> |
+
 
 **Flujo interno de cada trial**:
 
