@@ -309,8 +309,9 @@ Al iniciar, el script muestra en pantalla los valores de `env_kwargs` y comienza
 
 | Algoritmo | Hiperparámetros a buscar (Espacio de Búsqueda) |
 | --------- | ---------------------------------------------- |
-| **PPO**   | - `learning_rate`: LogUniform(1e-5, 1e-3) <br>
-- `n_steps`: Categorical([128,256,512,1024])  <br>
+| **PPO**   | 
+- `learning_rate`: LogUniform(1e-5, 1e-3) <br>
+- `n_steps`: Categorical(\[128,256,512,1024])  <br>
 - `gamma`: Uniform(0.95,0.9999)  <br>
 - `gae_lambda`: Uniform(0.8,1.0)  <br>
 - `ent_coef`: LogUniform(1e-8,1e-2)  <br>
