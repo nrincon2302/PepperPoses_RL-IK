@@ -26,7 +26,7 @@
 
 ## 1. Descripción general
 
-Este repositorio contiene la implementación de un **entorno de simulación** para los brazos (izquierdo y derecho) del robot Pepper, así como un **pipeline de entrenamiento** basado en **Stable-Baselines3** (SB3) y **Optuna** para realizar **Hyperparameter Optimization (HPO)** con los algoritmos **PPO** y **SAC**. Mediante **Curriculum Learning**, el agente aprende progresivamente a alcanzar objetivos en el espacio de trabajo factible, iniciando desde metas cercanas a su posición de arranque y ampliando gradualmente la dificultad.
+Este repositorio contiene la implementación de un entorno de simulación para los brazos (izquierdo y derecho) del robot Pepper, así como un pipeline de entrenamiento basado en **Stable-Baselines3** (SB3) y **Optuna** para realizar **Hyperparameter Optimization (HPO)** con los algoritmos **PPO** y **SAC**. Mediante **Curriculum Learning**, el agente aprende progresivamente a alcanzar objetivos en el espacio de trabajo factible, iniciando desde metas cercanas a su posición de arranque y ampliando gradualmente la dificultad.
 
 El objetivo es entrenar en simulación la cinemática inversa de cada brazo de Pepper (5 grados de libertad), sin acceder al robot real. Se emplean:
 
@@ -82,14 +82,14 @@ A continuación se muestra la estructura general del repositorio:
 
 Para reproducir el entorno y el entrenamiento, se recomiendan los siguientes pasos:
 
-1. **Crear un entorno virtual** (opcional pero recomendado):
+1. **Crear un entorno virtual**:
 
    ```bash
    python3 -m venv venv
    source venv/bin/activate
    ```
 
-2. **Instalar dependencias** (puedes crear un archivo `requirements.txt` con estas líneas):
+2. **Instalar dependencias**:
 
    ```text
    gymnasium
@@ -108,19 +108,6 @@ Para reproducir el entorno y el entrenamiento, se recomiendan los siguientes pas
    ```bash
    pip install -r requirements.txt
    ```
-
-3. **Estructura de carpetas**: Asegúrate de tener:
-
-   * `scripts/CSpace.py` y `scripts/robot_graph.py` con las funciones descritas.
-   * `pepper_env.py` y `train_pepper.py` en la raíz.
-
-4. **Verificar**: ejecuta brevemente:
-
-   ```bash
-   python pepper_env.py
-   ```
-
-   Esto iniciará el bloque interactivo y te permitirá probar un episodio con acciones aleatorias.
 
 ---
 
@@ -323,15 +310,13 @@ Al iniciar, el script muestra en pantalla los valores de `env_kwargs` y comienza
 | Algoritmo | Hiperparámetros a buscar (Espacio de Búsqueda) |
 | --------- | ---------------------------------------------- |
 | **PPO**   | - `learning_rate`: LogUniform(1e-5, 1e-3)      |
-
-```
         - `n_steps`: Categorical([128,256,512,1024])  
         - `gamma`: Uniform(0.95,0.9999)  
         - `gae_lambda`: Uniform(0.8,1.0)  
         - `ent_coef`: LogUniform(1e-8,1e-2)  
         - `clip_range`: Uniform(0.1,0.3)  
         - `vf_coef`: Uniform(0.1,1.0)                                                                                                           |
-```
+
 
 \| **SAC**   | - `learning_rate`: LogUniform(1e-5,1e-3)
 \- `buffer_size`: Categorical(\[100000,300000,500000])

@@ -1,5 +1,3 @@
-# model_statistics_graphs.py
-
 import os
 import argparse
 
@@ -7,94 +5,102 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-def analyze_and_plot(model_name: str):
+def plot_stats(model_name: str):
     base = "resultados_calibracion"
     folder = os.path.join(base, model_name)
 
-    # Paths
-    monitor_csv = os.path.join(folder, "monitor.csv")
-    progress_csv = os.path.join(folder, "tb_logs", "progress.csv")
-    curr_csv = os.path.join(folder, "curriculum_metrics.csv")
+    # 1) monitor.csv
+    df_mon = pd.read_csv(os.path.join(folder, "monitor.csv"), comment='#')
+    # columnas: r,l,t
 
-    # 1) Métricas globales
-    print(f"\n=== Métricas globales de '{model_name}' ===")
-    if os.path.exists(monitor_csv):
-        df_mon = pd.read_csv(monitor_csv)
-        # Detectar columnas
-        rew_col = next((c for c in df_mon.columns if 'reward' in c.lower() or c == 'r'), None)
-        len_col = next((c for c in df_mon.columns if 'l' == c), None)
+    # 2) curriculum_metrics.csv
+    df_curr = pd.read_csv(os.path.join(folder, "curriculum_metrics.csv"))
 
-        if rew_col:
-            rewards = df_mon[rew_col]
-            print(f"Total episodios: {len(rewards)}")
-            print(f"  Recompensa media   : {rewards.mean():.2f}")
-            print(f"  Recompensa mediana : {rewards.median():.2f}")
-            print(f"  Desv. estándar     : {rewards.std():.2f}")
-        if len_col:
-            lengths = df_mon[len_col]
-            print(f"  Longitud media ep. : {lengths.mean():.1f} pasos")
-        # Éxito global si is_success en curriculum
+    # 3) progress.csv con cabeceras según algoritmo
+    prog_path = os.path.join(folder, "tb_logs", "progress.csv")
+    df_tb = pd.read_csv(prog_path)
+
+    alg = model_name.split("-")[0]
+    if alg not in ["PPO", "SAC"]:
+        raise ValueError(f"Algoritmo no soportado: {alg}. Debe ser 'PPO' o 'SAC'.")
+
+    if alg == "PPO":
+        # columnas PPO
+        cols = [
+            "time/time_elapsed","time/iterations","rollout/ep_len_mean","rollout/success_rate",
+            "time/fps","rollout/ep_rew_mean","time/total_timesteps","train/n_updates",
+            "train/clip_range","train/learning_rate","train/value_loss",
+            "train/approx_kl","train/explained_variance","train/clip_fraction",
+            "train/std","train/policy_gradient_loss","train/entropy_loss","train/loss"
+        ]
     else:
-        print(f"⚠️ monitor.csv no encontrado en {folder}")
+        # columnas SAC
+        cols = [
+            "rollout/ep_rew_mean","rollout/success_rate","train/ent_coef","train/critic_loss",
+            "time/time_elapsed","train/actor_loss","rollout/ep_len_mean","train/n_updates",
+            "time/total_timesteps","train/learning_rate","time/fps","time/episodes"
+        ]
 
-    # 2) Evolución recompensa + value_loss
-    fig, ax1 = plt.subplots()
-    if os.path.exists(monitor_csv) and rew_col:
-        ax1.plot(df_mon.index + 1, df_mon[rew_col], color='tab:blue', label='Reward per episode')
-        ax1.set_xlabel("Episode")
-        ax1.set_ylabel("Reward", color='tab:blue')
-        ax1.tick_params(axis='y', labelcolor='tab:blue')
-    ax2 = ax1.twinx()
-    if os.path.exists(progress_csv):
-        df_tb = pd.read_csv(progress_csv)
-        # Detectar columnas
-        valcol = next((c for c in df_tb.columns if 'value_loss' in c.lower()), None)
-        itcol = next((c for c in df_tb.columns if 'iter' in c.lower() or 'step' in c.lower()), df_tb.columns[0])
-        if valcol:
-            ax2.plot(df_tb[itcol], df_tb[valcol], color='tab:red', label='Value loss')
-            ax2.set_ylabel("Value Loss", color='tab:red')
-            ax2.tick_params(axis='y', labelcolor='tab:red')
-    fig.suptitle(f"{model_name}: Recompensa y Value Loss")
-    fig.tight_layout()
+    # Filtrar solo las columnas existentes
+    cols = [c for c in cols if c in df_tb.columns]
+
+    # 1) Reward & Success Rate
+    plt.figure(figsize=(8,4))
+    eps = np.arange(1, len(df_mon)+1)
+    plt.plot(eps, df_mon["r"], label="Recompensa", color='tab:blue')
+    sr = df_curr["is_success"].rolling(10, min_periods=1).mean()
+    plt.plot(df_curr["episode"], sr * df_mon["r"].max(), label="Éxito(rolling)", color='tab:green')
+    plt.xlabel("Episodio")
+    plt.ylabel("Recompensa")
+    plt.title(f"{model_name}: Reward & Success")
+    plt.legend()
+    plt.tight_layout()
     plt.show()
 
-    # 3) Estadísticas de recompensa por etapa del currículo
-    if os.path.exists(curr_csv):
-        df_curr = pd.read_csv(curr_csv)
-        # Agrupar por etapa: detectamos los cambios en curriculum_radius
-        df_curr['stage'] = (df_curr['curriculum_radius']
-                            .diff().fillna(0) > 0).cumsum() + 1
-        stages = df_curr['stage'].unique()
+    # 2) Training metrics
+    plt.figure(figsize=(8,4))
+    if "rollout/ep_rew_mean" in cols:
+        plt.plot(df_tb["time/total_timesteps"], df_tb["rollout/ep_rew_mean"], label="Rew rollout")
+    if "train/value_loss" in cols:
+        plt.plot(df_tb["time/total_timesteps"], df_tb["train/value_loss"], label="Value loss")
+    if "train/actor_loss" in cols:
+        plt.plot(df_tb["time/total_timesteps"], df_tb["train/actor_loss"], label="Actor loss")
+    if "train/critic_loss" in cols:
+        plt.plot(df_tb["time/total_timesteps"], df_tb["train/critic_loss"], label="Critic loss")
+    plt.xlabel("Timesteps")
+    plt.ylabel("Valor / Loss")
+    plt.title(f"{model_name}: Training Metrics ({alg})")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
-        # Boxplot de recompensas por stage
-        plt.figure(figsize=(8, 4))
-        data = [df_curr.loc[df_curr['stage'] == s, 'total_reward'] for s in stages]
-        plt.boxplot(data, labels=[f"S{s}" for s in stages])
-        plt.xlabel("Curriculum Stage")
-        plt.ylabel("Recompensa por episodio")
-        plt.title(f"{model_name}: Distribución de recompensa por etapa")
-        plt.tight_layout()
-        plt.show()
+    # 3) Curriculum progress
+    fig, ax1 = plt.subplots(figsize=(8,4))
+    ax1.plot(df_curr["episode"], df_curr["curriculum_radius"], color='tab:orange', label="Radio")
+    ax2 = ax1.twinx()
+    ax2.plot(df_curr["episode"], df_curr["consecutive_successes"], color='tab:purple', label="Éxitos seg.")
+    ax1.set_xlabel("Episodio")
+    ax1.set_ylabel("Radio [m]")
+    ax2.set_ylabel("Éxitos")
+    fig.suptitle(f"{model_name}: Curriculum Progress")
+    ax1.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+    plt.tight_layout()
+    plt.show()
 
-        # Barra de recompensa media por stage
-        means = [d.mean() for d in data]
-        plt.figure()
-        plt.bar([f"S{s}" for s in stages], means)
-        plt.xlabel("Curriculum Stage")
-        plt.ylabel("Recompensa media")
-        plt.title(f"{model_name}: Recompensa media por etapa")
-        plt.tight_layout()
-        plt.show()
-    else:
-        print(f"⚠️ curriculum_metrics.csv no encontrado en {folder}")
+    # 4) Reward / stage
+    df_curr['stage'] = (df_curr['curriculum_radius'].diff().fillna(0)>0).cumsum()+1
+    stats = df_curr.groupby('stage')['total_reward'].agg(['mean','std'])
+    plt.figure(figsize=(6,4))
+    x = stats.index.astype(str)
+    plt.bar(x, stats['mean'], yerr=stats['std'], capsize=5)
+    plt.xlabel("Stage"); plt.ylabel("Reward")
+    plt.title(f"{model_name}: Reward per Stage")
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Graficar métricas avanzadas de entrenamiento"
-    )
-    parser.add_argument(
-        "model_name",
-        help="Nombre de la carpeta del experimento (e.g. PPO-1)"
-    )
-    args = parser.parse_args()
-    analyze_and_plot(args.model_name)
+    p = argparse.ArgumentParser()
+    p.add_argument("model_name")
+    args = p.parse_args()
+    plot_stats(args.model_name)

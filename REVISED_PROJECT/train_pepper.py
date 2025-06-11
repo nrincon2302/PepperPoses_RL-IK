@@ -1,5 +1,3 @@
-# train_pepper.py
-
 import os
 import argparse
 from datetime import datetime
@@ -282,7 +280,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Entrenamiento HPO con SB3 para PepperArmEnv")
     parser.add_argument("--timesteps", type=int, default=500_000,
                         help="Timesteps por trial")
-    parser.add_argument("--trials", type=int, default=10,
+    parser.add_argument("--trials", type=int, default=5,
                         help="Trials de HPO por algoritmo")
     parser.add_argument("--side", choices=["Left", "Right"], default="Left",
                         help="Brazo a entrenar")
@@ -294,7 +292,7 @@ if __name__ == "__main__":
                         help="Frac. de incremento del currículo")
     parser.add_argument("--max_steps", type=int, default=250,
                         help="Máx. pasos por episodio")
-    parser.add_argument("--required_succ", type=int, default=5,
+    parser.add_argument("--required_succ", type=int, default=2,
                         help="Éxitos consecutivos para subir nivel")
     args = parser.parse_args()
 
