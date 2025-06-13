@@ -78,7 +78,7 @@ class PepperArmEnv(gym.Env):
         # --- Parámetros internos ---
         self.max_steps = max_steps
         self.current_step = 0
-        self.goal_threshold = 0.02  # 2 cm
+        self.goal_threshold = 0.10  # 10 cm
 
         self.joint_angles = None   # numpy (5,)
         self.current_pos = None    # numpy (3,)
