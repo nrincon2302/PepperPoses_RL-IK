@@ -1,9 +1,11 @@
+# --- START OF FILE train_pepper.py ---
+# --- MODIFICADO ---
+
 import os
 import argparse
 from datetime import datetime
-
-import numpy as np
 import pandas as pd
+import numpy as np
 
 import optuna
 from optuna.samplers import TPESampler
@@ -17,87 +19,184 @@ from pepper_env import PepperArmEnv
 
 RESULTS_DIR = "resultados_calibracion"
 
-
-class CurriculumLoggingCallback(BaseCallback):
+class CurriculumCallback(BaseCallback):
     """
-    Callback para registrar métricas de currículo al final de cada episodio.
-    Genera un CSV con columnas:
-      - episode, total_reward, episode_length, is_success,
-      - curriculum_radius, consecutive_successes,
-      - final_joint_angles, target_pos
+    Callback para gestionar el Aprendizaje por Currículo y registrar métricas.
     """
-
-    def __init__(self, csv_path: str, verbose: int = 0):
+    def __init__(self, curriculum_params: dict, csv_path: str, verbose: int = 0):
         super().__init__(verbose)
         self.csv_path = csv_path
-        # Si no existe, creamos el CSV con cabeceras
+        
+        # Parámetros del currículo
+        self.start_frac = curriculum_params["start_frac"]
+        self.increment_frac = curriculum_params["increment_frac"]
+        self.required_successes = curriculum_params["required_successes"]
+        
+        # Estado del currículo
+        self.consecutive_successes = 0
+        self.current_radius = 0.0
+        self.max_radius = 0.0
+        self.increment = 0.0
+        self.initialized = False
+        
+        # Logging
+        self.episode_count = 0
         if not os.path.exists(self.csv_path):
-            df = pd.DataFrame(columns=[
-                "episode",
-                "total_reward",
-                "episode_length",
-                "is_success",
-                "curriculum_radius",
-                "consecutive_successes",
-                "final_joint_angles",
-                "target_pos"
-            ])
-            df.to_csv(self.csv_path, index=False)
+            pd.DataFrame(columns=[
+                "episode", "total_reward", "episode_length", "is_success",
+                "curriculum_radius", "consecutive_successes"
+            ]).to_csv(self.csv_path, index=False)
+
+    def _on_training_start(self) -> None:
+        """Inicializa los parámetros del currículo usando el entorno."""
+        if not self.initialized:
+            env = self.training_env.envs[0].env # Acceder al entorno base
+            self.max_radius = env.max_workspace_radius
+            self.current_radius = self.start_frac * self.max_radius
+            self.increment = self.increment_frac * self.max_radius
+            env.set_curriculum_radius(self.current_radius)
+            self.initialized = True
+            if self.verbose > 0:
+                print("--- Curriculum Callback Initialized ---")
+                print(f"Max Radius: {self.max_radius:.3f} m")
+                print(f"Start Radius: {self.current_radius:.3f} m")
+                print(f"Increment: {self.increment:.3f} m")
+                print("---------------------------------------")
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos", [])
-        if not infos:
-            return True
+        # Se ejecuta al final de cada episodio gracias a Monitor
+        for i, done in enumerate(self.locals["dones"]):
+            if done:
+                self.episode_count += 1
+                info = self.locals["infos"][i]
+                
+                # --- Lógica de actualización del currículo ---
+                if info.get("is_success", False):
+                    self.consecutive_successes += 1
+                else:
+                    self.consecutive_successes = 0
+                
+                if self.consecutive_successes >= self.required_successes:
+                    self.current_radius = min(self.current_radius + self.increment, self.max_radius)
+                    self.consecutive_successes = 0 # Resetear
+                    if self.verbose > 0:
+                        print(f"\n[Curriculum] Nivel aumentado! Nuevo radio: {self.current_radius:.3f} m\n")
 
-        # Leemos el CSV existente
-        df_all = pd.read_csv(self.csv_path)
+                # Actualizar el radio en el entorno para el próximo reset
+                self.training_env.env_method("set_curriculum_radius", self.current_radius)
 
-        for info in infos:
-            if "episode" in info:
-                epi = info["episode"]
-                total_reward = epi["r"]
-                length = epi["l"]
-                is_success = info.get("is_success", False)
-                curr_rad = info.get("curriculum_radius", np.nan)
-                consec = info.get("success_consecutive", np.nan)
-                angles = info.get("joint_angles", [])
-                target = info.get("target_pos", [])
+                # --- Lógica de logging ---
+                if "episode" in info:
+                    epi_info = info["episode"]
+                    log_data = {
+                        "episode": self.episode_count,
+                        "total_reward": epi_info["r"],
+                        "episode_length": epi_info["l"],
+                        "is_success": int(info.get("is_success", False)),
+                        "curriculum_radius": self.current_radius,
+                        "consecutive_successes": self.consecutive_successes,
+                    }
+                    df = pd.DataFrame([log_data])
+                    df.to_csv(self.csv_path, mode='a', header=False, index=False)
 
-                angles_str = np.array2string(np.array(angles), separator=",")
-                target_str = np.array2string(np.array(target), separator=",")
+                self.logger.record("curriculum/radius", self.current_radius)
+                self.logger.record("curriculum/consecutive_successes", self.consecutive_successes)
+                if 'is_success' in info:
+                    self.logger.record("rollout/success_rate", info.get('is_success', False))
 
-                new_row = {
-                    "episode": len(df_all) + 1,
-                    "total_reward": total_reward,
-                    "episode_length": length,
-                    "is_success": int(is_success),
-                    "curriculum_radius": float(curr_rad),
-                    "consecutive_successes": int(consec),
-                    "final_joint_angles": angles_str,
-                    "target_pos": target_str
-                }
-                df_all = pd.concat([df_all, pd.DataFrame([new_row])], ignore_index=True)
-
-        df_all.to_csv(self.csv_path, index=False)
         return True
 
-
 def make_env(seed: int, log_folder: str, **env_kwargs):
-    """
-    Crea un PepperArmEnv y lo envuelve en Monitor.
-    Fija la semilla ANTES de envolverlo.
-    """
     os.makedirs(log_folder, exist_ok=True)
+    # El render_mode='human' debe pasarse aquí
     env_raw = PepperArmEnv(**env_kwargs)
-    env_raw.seed(seed)
+    # La nueva API de Gymnasium usa reset(seed=...) en lugar de env.seed()
+    # Monitor se encargará de esto si se pasa la semilla al reset del modelo
     monitor_path = os.path.join(log_folder, "monitor.csv")
     return Monitor(env_raw, filename=monitor_path)
 
+def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, base_dir: str):
+    """Función objetivo genérica para PPO y SAC."""
+    trial_id = trial.number
+    alg_folder = os.path.join(base_dir, f"{alg_name}-{trial_id}")
+    os.makedirs(alg_folder, exist_ok=True)
+    
+    # Logger de SB3
+    logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
+    tb_log_path = os.path.join(alg_folder, "tb_logs")
+    
+    # Entornos
+    train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
+    eval_env = make_env(seed=trial_id + 1000, log_folder=os.path.join(alg_folder, "eval"), **env_kwargs)
+    
+    # Callbacks
+    curriculum_cb = CurriculumCallback(
+        curriculum_params=curriculum_params,
+        csv_path=os.path.join(alg_folder, "curriculum_metrics.csv"),
+        verbose=1
+    )
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=alg_folder,
+        log_path=os.path.join(alg_folder, "eval_logs"),
+        eval_freq=max(5000, total_timesteps // 20),
+        n_eval_episodes=10,
+        deterministic=True
+    )
 
-def evaluate_policy(model, env, n_eval_episodes: int = 5):
-    """
-    Ejecuta la política determinística durante n_eval_episodes y devuelve (mean_reward, std_reward).
-    """
+    policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
+
+    # Hiperparámetros y creación del modelo
+    if alg_name == "PPO":
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+            "n_steps": trial.suggest_categorical("n_steps", [256, 512, 1024, 2048]),
+            "gamma": trial.suggest_float("gamma", 0.9, 0.9999),
+            "gae_lambda": trial.suggest_float("gae_lambda", 0.8, 0.99),
+            "ent_coef": trial.suggest_float("ent_coef", 1e-8, 1e-1, log=True),
+            "clip_range": trial.suggest_float("clip_range", 0.1, 0.4),
+            "vf_coef": trial.suggest_float("vf_coef", 0.1, 1.0),
+            "batch_size": 64,
+        }
+        model = PPO("MlpPolicy", train_env, **params, policy_kwargs=policy_kwargs, tensorboard_log=tb_log_path)
+    else: # SAC
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+            "buffer_size": trial.suggest_categorical("buffer_size", [100_000, 300_000, 1_000_000]),
+            "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
+            "tau": trial.suggest_float("tau", 0.005, 0.05),
+            "gamma": trial.suggest_float("gamma", 0.9, 0.9999),
+            "train_freq": trial.suggest_categorical("train_freq", [1, 4, 8, 16]),
+            "gradient_steps": trial.suggest_categorical("gradient_steps", [1, 4, 8, 16]),
+            "ent_coef": 'auto',
+        }
+        model = SAC("MlpPolicy", train_env, **params, policy_kwargs=policy_kwargs, tensorboard_log=tb_log_path)
+    
+    model.set_logger(logger)
+    
+    try:
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=CallbackList([curriculum_cb, eval_cb]),
+            progress_bar=True
+        )
+    except Exception as e:
+        print(f"Error durante el entrenamiento en el trial {trial_id}: {e}")
+        # Optuna manejará esto como un trial fallido
+        raise optuna.exceptions.TrialPruned()
+
+    # Guardar modelo final y evaluar
+    model.save(os.path.join(alg_folder, "final_model"))
+    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=20)
+    
+    # Cerrar entornos para liberar recursos de pybullet
+    train_env.close()
+    eval_env.close()
+
+    return mean_reward
+
+# Copiado de evaluate_model.py para usar aquí
+def evaluate_policy(model, env, n_eval_episodes: int = 10):
     rewards = []
     for _ in range(n_eval_episodes):
         obs, _ = env.reset()
@@ -111,163 +210,22 @@ def evaluate_policy(model, env, n_eval_episodes: int = 5):
         rewards.append(total_r)
     return np.mean(rewards), np.std(rewards)
 
-
-def optimize_ppo(trial: optuna.Trial, env_kwargs, total_timesteps: int, base_dir: str):
-    """
-    Función objetivo PPO para Optuna.
-    """
-    # Espacio de búsqueda
-    lr = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
-    n_steps = trial.suggest_categorical("n_steps", [128, 256, 512, 1024])
-    gamma = trial.suggest_uniform("gamma", 0.95, 0.9999)
-    gae_lambda = trial.suggest_uniform("gae_lambda", 0.8, 1.0)
-    ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
-    clip_range = trial.suggest_uniform("clip_range", 0.1, 0.3)
-    vf_coef = trial.suggest_uniform("vf_coef", 0.1, 1.0)
-
-    # Carpeta de este trial
-    trial_id = trial.number + 1
-    alg_folder = os.path.join(base_dir, f"PPO-{trial_id}")
-    os.makedirs(alg_folder, exist_ok=True)
-
-    # Logger de SB3
-    logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
-
-    # Entorno de entrenamiento y evaluación
-    train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
-    eval_env = make_env(seed=trial_id + 1000, log_folder=os.path.join(alg_folder, "eval"), **env_kwargs)
-
-    # Callbacks
-    curriculum_cb = CurriculumLoggingCallback(csv_path=os.path.join(alg_folder, "curriculum_metrics.csv"))
-    eval_cb = EvalCallback(
-        eval_env,
-        best_model_save_path=alg_folder,
-        log_path=os.path.join(alg_folder, "eval_logs"),
-        eval_freq=max(1, total_timesteps // 10),
-        n_eval_episodes=5,
-        deterministic=True,
-        verbose=0
-    )
-
-    # Crear modelo PPO
-    model = PPO(
-        "MlpPolicy",
-        train_env,
-        learning_rate=lr,
-        n_steps=n_steps,
-        batch_size=64,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        ent_coef=ent_coef,
-        clip_range=clip_range,
-        vf_coef=vf_coef,
-        verbose=0,
-        tensorboard_log=os.path.join(alg_folder, "tb_logs")
-    )
-    model.set_logger(logger)
-
-    # Entrenar con barra de progreso integrada
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=CallbackList([curriculum_cb, eval_cb]),
-        progress_bar=True
-    )
-
-    # Guardar modelo final
-    model.save(os.path.join(alg_folder, "final_model"))
-
-    # Evaluar recompensa media final
-    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10)
-    return mean_reward
-
-
-def optimize_sac(trial: optuna.Trial, env_kwargs, total_timesteps: int, base_dir: str):
-    """
-    Función objetivo SAC para Optuna.
-    """
-    # Espacio de búsqueda
-    lr = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
-    buffer_size = trial.suggest_categorical("buffer_size", [100_000, 300_000, 500_000])
-    batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
-    tau = trial.suggest_uniform("tau", 0.005, 0.05)
-    gamma = trial.suggest_uniform("gamma", 0.95, 0.9999)
-    train_freq = trial.suggest_categorical("train_freq", [1, 2, 4, 8])
-    ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
-
-    # Carpeta de este trial
-    trial_id = trial.number + 1
-    alg_folder = os.path.join(base_dir, f"SAC-{trial_id}")
-    os.makedirs(alg_folder, exist_ok=True)
-
-    # Logger
-    logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
-
-    # Entornos
-    train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
-    eval_env = make_env(seed=trial_id + 1000, log_folder=os.path.join(alg_folder, "eval"), **env_kwargs)
-
-    # Callbacks
-    curriculum_cb = CurriculumLoggingCallback(csv_path=os.path.join(alg_folder, "curriculum_metrics.csv"))
-    eval_cb = EvalCallback(
-        eval_env,
-        best_model_save_path=alg_folder,
-        log_path=os.path.join(alg_folder, "eval_logs"),
-        eval_freq=max(1, total_timesteps // 10),
-        n_eval_episodes=5,
-        deterministic=True,
-        verbose=0
-    )
-
-    # Crear modelo SAC
-    model = SAC(
-        "MlpPolicy",
-        train_env,
-        learning_rate=lr,
-        buffer_size=buffer_size,
-        batch_size=batch_size,
-        tau=tau,
-        gamma=gamma,
-        train_freq=train_freq,
-        ent_coef=ent_coef,
-        verbose=0,
-        tensorboard_log=os.path.join(alg_folder, "tb_logs")
-    )
-    model.set_logger(logger)
-
-    # Entrenar con barra de progreso integrada
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=CallbackList([curriculum_cb, eval_cb]),
-        progress_bar=True
-    )
-
-    # Guardar modelo final
-    model.save(os.path.join(alg_folder, "final_model"))
-
-    # Evaluar recompensa media final
-    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=10)
-    return mean_reward
-
-
-def run_hpo(alg_name: str, env_kwargs: dict, total_timesteps: int, n_trials: int):
-    """
-    Ejecuta HPO con Optuna para 'PPO' o 'SAC'.
-    """
+def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, n_trials: int):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     study = optuna.create_study(
-        sampler=TPESampler(),
+        sampler=TPESampler(seed=42),
         direction="maximize",
         study_name=f"{alg_name}_Study_{datetime.now():%Y%m%d_%H%M%S}"
     )
 
-    if alg_name == "PPO":
-        func = lambda trial: optimize_ppo(trial, env_kwargs, total_timesteps, RESULTS_DIR)
-    else:
-        func = lambda trial: optimize_sac(trial, env_kwargs, total_timesteps, RESULTS_DIR)
+    func = lambda trial: optimize_agent(trial, alg_name, env_kwargs, curriculum_params, total_timesteps, RESULTS_DIR)
+    
+    try:
+        study.optimize(func, n_trials=n_trials, timeout=3600*8) # 8 horas de timeout
+    except KeyboardInterrupt:
+        print("HPO interrumpido por el usuario.")
 
-    study.optimize(func, n_trials=n_trials)
-
-    # Guardar resultados del estudio
+    # Guardar resultados
     df = study.trials_dataframe()
     df.to_csv(os.path.join(RESULTS_DIR, f"{alg_name}_hpo_results.csv"), index=False)
 
@@ -275,42 +233,41 @@ def run_hpo(alg_name: str, env_kwargs: dict, total_timesteps: int, n_trials: int
     print("Mejores parámetros:", study.best_params)
     print(f"Recompensa media objetivo: {study.best_value:.2f}\n")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Entrenamiento HPO con SB3 para PepperArmEnv")
-    parser.add_argument("--timesteps", type=int, default=500_000,
-                        help="Timesteps por trial")
-    parser.add_argument("--trials", type=int, default=5,
-                        help="Trials de HPO por algoritmo")
-    parser.add_argument("--side", choices=["Left", "Right"], default="Left",
-                        help="Brazo a entrenar")
-    parser.add_argument("--n_samples", type=int, default=8,
-                        help="Muestras por dimensión en CSpace")
-    parser.add_argument("--start_frac", type=float, default=0.2,
-                        help="Frac. inicial del currículo")
-    parser.add_argument("--incr_frac", type=float, default=0.1,
-                        help="Frac. de incremento del currículo")
-    parser.add_argument("--max_steps", type=int, default=250,
-                        help="Máx. pasos por episodio")
-    parser.add_argument("--required_succ", type=int, default=2,
-                        help="Éxitos consecutivos para subir nivel")
+    parser.add_argument("--alg", choices=["PPO", "SAC"], default="SAC", help="Algoritmo a optimizar")
+    parser.add_argument("--timesteps", type=int, default=2_000_000, help="Timesteps por trial")
+    parser.add_argument("--trials", type=int, default=10, help="Trials de HPO")
+    parser.add_argument("--side", choices=["Left", "Right"], default="Left", help="Brazo a entrenar")
+    parser.add_argument("--n_samples", type=int, default=8, help="Muestras por dimensión en CSpace")
+    parser.add_argument("--max_steps", type=int, default=250, help="Máx. pasos por episodio")
+    # Argumentos del currículo
+    parser.add_argument("--start_frac", type=float, default=0.2, help="Frac. inicial del currículo")
+    parser.add_argument("--incr_frac", type=float, default=0.1, help="Frac. de incremento del currículo")
+    parser.add_argument("--required_succ", type=int, default=5, help="Éxitos consecutivos para subir nivel")
+
     args = parser.parse_args()
 
     env_kwargs = {
         "side": args.side,
-        "render_mode": None,
+        "render_mode": None, # Sin GUI para HPO
         "max_steps": args.max_steps,
         "n_workspace_samples": args.n_samples,
-        "curriculum_start_frac": args.start_frac,
-        "curriculum_increment_frac": args.incr_frac,
-        "required_consecutive_successes": args.required_succ
     }
 
-    print("\n=== Iniciando HPO ===")
+    args = parser.parse_args()
+
+    curriculum_params = {
+        "start_frac": args.start_frac,
+        "increment_frac": args.incr_frac,
+        "required_successes": args.required_succ,
+    }
+
+    print(f"\n=== Iniciando HPO para {args.alg} ===")
     print(f"Configuración de entorno: {env_kwargs}")
+    print(f"Parámetros de currículo: {curriculum_params}")
     print(f"Timesteps: {args.timesteps}, Trials: {args.trials}\n")
 
-    #run_hpo("PPO", env_kwargs, args.timesteps, args.trials)
-    run_hpo("SAC", env_kwargs, args.timesteps, args.trials)
+    run_hpo(args.alg, env_kwargs, curriculum_params, args.timesteps, args.trials)
 
     print("=== Entrenamiento y HPO completados ===")
