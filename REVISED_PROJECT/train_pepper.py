@@ -236,7 +236,7 @@ def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_time
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Entrenamiento HPO con SB3 para PepperArmEnv")
     parser.add_argument("--alg", choices=["PPO", "SAC"], default="SAC", help="Algoritmo a optimizar")
-    parser.add_argument("--timesteps", type=int, default=2_000_000, help="Timesteps por trial")
+    parser.add_argument("--timesteps", type=int, default=100_000, help="Timesteps por trial")
     parser.add_argument("--trials", type=int, default=10, help="Trials de HPO")
     parser.add_argument("--side", choices=["Left", "Right"], default="Left", help="Brazo a entrenar")
     parser.add_argument("--n_samples", type=int, default=8, help="Muestras por dimensión en CSpace")

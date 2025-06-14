@@ -40,7 +40,7 @@ class PepperArmEnv(gym.Env):
         
         # Obtenemos los nombres de los joints de qiBullet
         self.joint_keys = [f'{self.side[0]}ShoulderPitch', f'{self.side[0]}ShoulderRoll', f'{self.side[0]}ElbowYaw', f'{self.side[0]}ElbowRoll', f'{self.side[0]}WristYaw']
-        self.end_effector_link_name = f"{self.side.lower()}_hand" # Nombre del link del efector final
+        self.end_effector_link_name = f"{self.side[0].lower()}_hand"
 
         self.joint_limits_low = np.array([self.joint_limits[k][0] for k in self.joint_keys], dtype=np.float32)
         self.joint_limits_high = np.array([self.joint_limits[k][1] for k in self.joint_keys], dtype=np.float32)
@@ -51,7 +51,7 @@ class PepperArmEnv(gym.Env):
 
         # --- Parámetros internos ---
         self.max_steps = max_steps
-        self.goal_threshold = 0.10
+        self.goal_threshold = 0.05
         
         # --- Estado del episodio ---
         self.current_step = 0
