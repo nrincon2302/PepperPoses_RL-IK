@@ -1,11 +1,12 @@
 # --- START OF FILE pepper_env.py ---
-# --- MODIFICADO ---
+# --- VERSIÓN FINAL OPTIMIZADA ---
 
+import time
 import gymnasium as gym
 import numpy as np
+import pybullet as p
 from gymnasium import spaces
-from gymnasium.utils import seeding
-from qibullet import SimulationManager, PepperVirtual
+from qibullet import SimulationManager
 
 # Los scripts de CSpace y robot_graph ahora son utilidades, no dependencias del core
 from scripts.CSpace import generate_workspace_points
@@ -13,70 +14,96 @@ from scripts.robot_graph import LEFT_JOINT_LIMITS, RIGHT_JOINT_LIMITS
 
 class PepperArmEnv(gym.Env):
     """
-    Entorno de Gymnasium para control de un brazo de Pepper usando qiBullet para
-    la dinámica y la visualización. El currículo se gestiona externamente.
+    Entorno de Gymnasium de alto rendimiento para control de un brazo de Pepper.
+    Utiliza control de bajo nivel de PyBullet para una simulación rápida, ideal para RL.
     """
-    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
+    metadata = {"render_modes": ["human"], "render_fps": 30}
 
     def __init__(
         self,
         side: str = 'Left',
-        render_mode: str = None, # 'human' inicia la GUI de pybullet
+        render_mode: str = None,
         max_steps: int = 250,
         n_workspace_samples: int = 8,
     ):
         super().__init__()
         
-        # --- Configuración del simulador y el robot ---
         self.render_mode = render_mode
+        self.side = side
+        self.max_steps = max_steps
+        self.goal_threshold = 0.10
+
+        # --- Configuración del simulador y el robot ---
         self.simulation_manager = SimulationManager()
-        self.client = self.simulation_manager.launchSimulation(gui=(self.render_mode == 'human'))
+        connection_mode = p.GUI if self.render_mode == 'human' else p.DIRECT
+        self.client = self.simulation_manager.launchSimulation(gui=True if connection_mode==p.GUI else False)
+        
         self.pepper = self.simulation_manager.spawnPepper(self.client, spawn_ground_plane=True)
+        self.pepper_id = self.pepper.getRobotModel()
+
+        # --- Frecuencias de simulación y control ---
+        self.sim_frequency = 240  # Hz
+        self.control_frequency = 30  # Hz
+        self.sim_steps_per_control_step = self.sim_frequency // self.control_frequency
+        p.setGravity(0, 0, -9.8, physicsClientId=self.client)
+        p.setTimeStep(1.0 / self.sim_frequency, physicsClientId=self.client)
 
         # --- Configuración del brazo y límites articulares ---
         assert side in ('Left', 'Right'), "side debe ser 'Left' o 'Right'"
-        self.side = side
         self.joint_limits = LEFT_JOINT_LIMITS if side == 'Left' else RIGHT_JOINT_LIMITS
         
-        # Obtenemos los nombres de los joints de qiBullet
         self.joint_keys = [f'{self.side[0]}ShoulderPitch', f'{self.side[0]}ShoulderRoll', f'{self.side[0]}ElbowYaw', f'{self.side[0]}ElbowRoll', f'{self.side[0]}WristYaw']
-        self.end_effector_link_name = f"{self.side[0].lower()}_hand"
+        self.end_effector_link_name = f"{self.side.lower()}_hand"
+        
+        all_joint_names = [p.getJointInfo(self.pepper_id, i)[1].decode('UTF-8') for i in range(p.getNumJoints(self.pepper_id))]
+        self.joint_indices = [all_joint_names.index(name) for name in self.joint_keys]
 
         self.joint_limits_low = np.array([self.joint_limits[k][0] for k in self.joint_keys], dtype=np.float32)
         self.joint_limits_high = np.array([self.joint_limits[k][1] for k in self.joint_keys], dtype=np.float32)
+        self.joint_centers = (self.joint_limits_low + self.joint_limits_high) / 2.0
+        self.joint_ranges = self.joint_limits_high - self.joint_limits_low
 
         # --- Espacios de acción y observación ---
         self.action_space = spaces.Box(low=-0.05, high=0.05, shape=(5,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
-
-        # --- Parámetros internos ---
-        self.max_steps = max_steps
-        self.goal_threshold = 0.05
-        
-        # --- Estado del episodio ---
-        self.current_step = 0
-        self.joint_angles = None
-        self.current_pos = None
-        self.target_pos = None
-        self.prev_distance = None
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32) # 5 angs + 5 vels + 3 goal_vec
 
         # --- Workspace y Currículo ---
         points, _ = generate_workspace_points(side=self.side, n_samples=n_workspace_samples)
         self.workspace_points = points.astype(np.float32)
-        
-        # El radio actual se establece desde fuera a través de un método
         self.max_workspace_radius = np.max(np.linalg.norm(self.workspace_points - np.mean(self.workspace_points, axis=0), axis=1))
-        self.current_curriculum_radius = self.max_workspace_radius # Por defecto, sin currículo
+        self.current_curriculum_radius = self.max_workspace_radius
 
-        self.np_random, _ = seeding.np_random(None)
+        # --- Estado del episodio ---
+        self.current_step = 0
+        self.joint_angles = None
+        self.joint_velocities = None
+        self.current_pos = None
+        self.target_pos = None
+        self.prev_distance = None
+
+        self.np_random, _ = np.random.RandomState(None), None
     
+    def seed(self, seed=None):
+        """Para compatibilidad con API antigua de gym."""
+        self.np_random, seed_val = np.random.RandomState(seed), seed
+        return [seed_val]
+
     def set_curriculum_radius(self, radius: float):
-        """Método para que el Callback de entrenamiento actualice el radio."""
         self.current_curriculum_radius = radius
 
+    def _update_robot_state(self):
+        """Lee y actualiza el estado completo del robot desde PyBullet."""
+        joint_states = p.getJointStates(self.pepper_id, self.joint_indices, physicsClientId=self.client)
+        self.joint_angles = np.array([state[0] for state in joint_states], dtype=np.float32)
+        self.joint_velocities = np.array([state[1] for state in joint_states], dtype=np.float32)
+        
+        # Posición del efector final
+        link_state = p.getLinkState(self.pepper_id, self.joint_indices[-1] + 1, computeForwardKinematics=True, physicsClientId=self.client)
+        self.current_pos = np.array(link_state[0], dtype=np.float32)
+    
     def _get_obs(self):
         goal_vector = self.target_pos - self.current_pos
-        return np.concatenate([self.joint_angles, goal_vector]).astype(np.float32)
+        return np.concatenate([self.joint_angles, self.joint_velocities, goal_vector]).astype(np.float32)
     
     def _get_info(self):
         distance = np.linalg.norm(self.target_pos - self.current_pos)
@@ -89,12 +116,27 @@ class PepperArmEnv(gym.Env):
         }
 
     def _compute_reward(self, distance, prev_distance, action, hit_limits):
-        improvement = (prev_distance - distance) * 30.0
-        proximity = -5.0 * distance
-        smoothness = -0.15 * np.sum(np.square(action))
-        limits_penalty = -2.0 if hit_limits else 0.0
+        # 1. Penalización por distancia (potencial negativo)
+        distance_penalty = -5.0 * distance
+        # 2. Recompensa por mejora (shaping)
+        improvement_reward = (prev_distance - distance) * 30.0
+        # 3. Penalización por esfuerzo (acciones suaves)
+        action_penalty = -0.15 * np.sum(np.square(action))
+        # 4. Penalización por chocar con los límites
+        limits_penalty = -0.5 if hit_limits else 0.0
+        # 5. Bonus por éxito (reducido)
         success_bonus = 25.0 if distance <= self.goal_threshold else 0.0
-        return improvement + proximity + smoothness + limits_penalty + success_bonus
+        # 6. Penalización anti-oscilación
+        settling_penalty = 0.0
+        if distance < (self.goal_threshold * 1.5):
+            speed = np.linalg.norm(self.joint_velocities, ord=1)
+            settling_penalty = -0.5 * speed
+        # 7. Bonus de exploración articular
+        normalized_dist_from_center = np.abs(self.joint_angles - self.joint_centers) / (self.joint_ranges / 2.0)
+        exploration_bonus = 0.05 * np.sum(normalized_dist_from_center)
+        
+        return (distance_penalty + improvement_reward + action_penalty + limits_penalty +
+                success_bonus + settling_penalty + exploration_bonus)
 
     def _sample_target(self):
         distances_from_init = np.linalg.norm(self.workspace_points - self.current_pos[None, :], axis=1)
@@ -105,78 +147,69 @@ class PepperArmEnv(gym.Env):
             closest_idx = np.argmin(distances_from_init)
             valid_points = self.workspace_points[closest_idx][None, :]
 
-        idx = self.np_random.integers(0, len(valid_points))
+        idx = self.np_random.randint(0, len(valid_points))
         base_target = valid_points[idx]
         noise = self.np_random.uniform(-0.02, 0.02, size=3).astype(np.float32)
         return (base_target + noise)
 
-    def is_reachable(self, point: np.ndarray, tol: float = 0.02) -> bool:
-        dists = np.linalg.norm(self.workspace_points - point[None, :], axis=1)
-        return bool(np.min(dists) <= tol)
-
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.current_step = 0
-
-        # Posición inicial aleatoria
-        self.joint_angles = self.np_random.uniform(self.joint_limits_low, self.joint_limits_high).astype(np.float32)
-        self.pepper.setAngles(self.joint_keys, self.joint_angles.tolist(), 1.0)
+        if seed is not None:
+            self.seed(seed)
         
-        # Obtenemos la posición del efector desde el simulador
-        link_state = self.pepper.getLinkPosition(self.end_effector_link_name)
-        self.current_pos = np.array(link_state[0], dtype=np.float32)
-
+        self.current_step = 0
         options = options or {}
+
+        # Resetear el estado del robot a una pose aleatoria
+        initial_angles = self.np_random.uniform(self.joint_limits_low, self.joint_limits_high)
+        for i, angle in enumerate(initial_angles):
+            p.resetJointState(self.pepper_id, self.joint_indices[i], angle, physicsClientId=self.client)
+        
+        self._update_robot_state()
+
         if 'target_pos' in options:
-            candidate = np.array(options['target_pos'], dtype=np.float32)
-            if not self.is_reachable(candidate):
-                raise ValueError(f"Target {candidate} no es alcanzable.")
-            self.target_pos = candidate
+            self.target_pos = np.array(options['target_pos'], dtype=np.float32)
         else:
             self.target_pos = self._sample_target()
 
         self.prev_distance = np.linalg.norm(self.target_pos - self.current_pos)
         
-        observation = self._get_obs()
-        info = self._get_info()
-        return observation, info
+        return self._get_obs(), self._get_info()
 
     def step(self, action):
         self.current_step += 1
-        action = np.asarray(action, dtype=np.float32)
-
-        new_angles = np.clip(self.joint_angles + action, self.joint_limits_low, self.joint_limits_high)
-        hit_limits = np.any(
-            (new_angles <= self.joint_limits_low + 1e-6) |
-            (new_angles >= self.joint_limits_high - 1e-6)
+        
+        target_angles = np.clip(self.joint_angles + action, self.joint_limits_low, self.joint_limits_high)
+        hit_limits = np.any((target_angles <= self.joint_limits_low + 1e-6) | (target_angles >= self.joint_limits_high - 1e-6))
+        
+        p.setJointMotorControlArray(
+            bodyUniqueId=self.pepper_id,
+            jointIndices=self.joint_indices,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=target_angles,
+            forces=[50.0] * len(self.joint_indices),
+            positionGains=[0.03] * len(self.joint_indices),
+            velocityGains=[1.0] * len(self.joint_indices),
+            physicsClientId=self.client
         )
         
-        # Aplicar ángulos en el simulador
-        self.pepper.setAngles(self.joint_keys, new_angles.tolist(), 1.0)
+        for _ in range(self.sim_steps_per_control_step):
+            p.stepSimulation(physicsClientId=self.client)
+            if self.render_mode == 'human':
+                time.sleep(1.0 / self.sim_frequency)
+
+        self._update_robot_state()
         
-        # Obtener nueva posición desde el simulador
-        link_state = self.pepper.getLinkPosition(self.end_effector_link_name)
-        new_pos = np.array(link_state[0], dtype=np.float32)
-        
-        distance = np.linalg.norm(self.target_pos - new_pos)
+        distance = np.linalg.norm(self.target_pos - self.current_pos)
         reward = self._compute_reward(distance, self.prev_distance, action, hit_limits)
-
-        self.joint_angles = new_angles
-        self.current_pos = new_pos
+        
         self.prev_distance = distance
-
+        
         terminated = bool(distance <= self.goal_threshold)
         truncated = bool(self.current_step >= self.max_steps)
 
-        observation = self._get_obs()
-        info = self._get_info()
-
-        return observation, float(reward), terminated, truncated, info
-
-    def render(self):
-        # La GUI se actualiza automáticamente si render_mode='human'
-        # Esta función es para compatibilidad, pero no hace nada extra
-        pass
+        return self._get_obs(), float(reward), terminated, truncated, self._get_info()
 
     def close(self):
-        self.simulation_manager.stopSimulation(self.client)
+        if self.client is not None:
+            self.simulation_manager.stopSimulation(self.client)
+            self.client = None

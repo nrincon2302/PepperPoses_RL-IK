@@ -11,6 +11,8 @@ from stable_baselines3 import PPO, SAC
 from pepper_env import PepperArmEnv
 from scripts.CSpace import generate_workspace_points
 
+import matplotlib.pyplot as plt
+
 
 def obtener_targets(base_dir, n_tests, side, semilla=0):
     np.random.seed(semilla)
@@ -64,13 +66,18 @@ def evaluar(modelo_folder: str, targets: np.ndarray, side: str, show_gui: bool):
             print(f"Prueba {i+1}/{len(targets)}. Target: {tgt}. Presiona Enter para continuar...")
             input()
 
-        obs, _ = env.reset(options={"target_pos": tgt})
+        obs, info = env.reset(options={"target_pos": tgt})
+        
+        # El estado inicial ya incluye los ángulos
+        angles_history = [info['joint_angles'].copy()]
+
         done, total_steps = False, 0
         t0 = time.time()
         
         while not done:
             action, _ = agente.predict(obs, deterministic=True)
             obs, _, terminated, truncated, info = env.step(action)
+            angles_history.append(info['joint_angles'].copy())
             done = terminated or truncated
             total_steps += 1
             if show_gui:
@@ -83,6 +90,20 @@ def evaluar(modelo_folder: str, targets: np.ndarray, side: str, show_gui: bool):
             exitos += 1
         
         print(f"  Resultado: Error final={err:.4f} m, Pasos={total_steps}, Éxito={info['is_success']}")
+        print("  Ángulos finales:", info['joint_angles'])
+
+        # Crear la gráfica
+        plt.figure(figsize=(10, 6))
+        for name in env.joint_keys:
+            plt.plot(angles_history, label=name)
+        
+        plt.title(f"Evolución de Ángulos - {modelo_folder} (Última Prueba)")
+        plt.xlabel("Paso de tiempo")
+        plt.ylabel("Ángulo [rad]")
+        plt.grid(True)
+        plt.legend([f"{side[0]}ShoulderPitch", f"{side[0]}ShoulderRoll", f"{side[0]}ElbowYaw", f"{side[0]}ElbowRoll", f"{side[0]}WristYaw", f"{side[0]}WristRoll"])
+        plt.tight_layout()
+        plt.show() # Mostrar la gráfica al final
 
     env.close()
 
