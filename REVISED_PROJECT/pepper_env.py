@@ -122,7 +122,7 @@ class PepperArmEnv(gym.Env):
         # Penalización por acción brusca (movimiento poco suave de los joints)
         smoothness = -0.15 * np.sum(np.square(action))
         # Penalización por alcanzar los límites de los joints o moverse fuera de estos
-        limits_penalty = -2.0 if hit_limits else 0.0
+        limits_penalty = -0.75 if hit_limits else 0.0
         # Bonificación por alcanzar el objetivo
         success_bonus = 25.0 if distance <= self.goal_threshold else 0.0
 
