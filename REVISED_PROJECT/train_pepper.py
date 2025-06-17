@@ -11,6 +11,8 @@ from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CallbackList
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import VecEnv
 
 from pepper_env import PepperArmEnv
 
@@ -51,13 +53,22 @@ class CurriculumCallback(BaseCallback):
         Inicializa los parámetros del currículo usando el entorno.
         """
         if not self.initialized:
-            env = self.training_env.envs[0].env # Acceder al entorno base
-            self.max_radius = env.max_workspace_radius
+            # =========================================================
+            # CORRECCIÓN: Usar get_attr para acceder de forma segura a los atributos
+            # del entorno base a través de los wrappers (VecEnv, Monitor).
+            # get_attr devuelve una lista, una por cada entorno paralelo.
+            # Como el radio es el mismo para todos, tomamos el del primero.
+            # =========================================================
+            all_max_radii = self.training_env.get_attr('max_workspace_radius')
+            self.max_radius = all_max_radii[0]
+            
             self.current_radius = self.start_frac * self.max_radius
             self.increment = self.increment_frac * self.max_radius
-            env.set_curriculum_radius(self.current_radius)
+            
+            # Usar env_method para establecer el radio en todos los entornos paralelos
+            self.training_env.env_method("set_curriculum_radius", self.current_radius)
             self.initialized = True
-            # Escritura en consola del entrenamiento inicializado
+            
             if self.verbose > 0:
                 print("--- Callback del Curriculum iniciado ---")
                 print(f"Radio máximo: {self.max_radius:.3f} m")
@@ -75,28 +86,21 @@ class CurriculumCallback(BaseCallback):
                 self.episode_count += 1
                 info = self.locals["infos"][i]
                 
-                # ===============================================
                 # Actualización del currículo
-                # ===============================================
-                # Contar la cantidad de éxitos consecutivos
                 if info.get("is_success", False):
                     self.consecutive_successes += 1
                 else:
                     self.consecutive_successes = 0
                 
-                # Si se alcanzó el número requerido de éxitos, aumentar el radio
                 if self.consecutive_successes >= self.required_successes:
                     self.current_radius = min(self.current_radius + self.increment, self.max_radius)
-                    self.consecutive_successes = 0 # Resetear a cero
+                    self.consecutive_successes = 0 
                     if self.verbose > 0:
                         print(f"\n[Curriculum] Nivel aumentado! Nuevo radio: {self.current_radius:.3f} m\n")
 
-                # Actualizar el radio en el entorno para el próximo reset
                 self.training_env.env_method("set_curriculum_radius", self.current_radius)
 
-                # ===============================================
                 # Registro de métricas
-                # ===============================================
                 if "episode" in info:
                     epi_info = info["episode"]
                     log_data = {
@@ -117,17 +121,19 @@ class CurriculumCallback(BaseCallback):
 
         return True
 
-def make_env(seed: int, log_folder: str, **env_kwargs):
+def make_env_fn(log_folder: str, **env_kwargs):
     """
-    Crea un entorno PepperArmEnv con monitorización y logging.
+    Función de ayuda para crear el entorno con un Monitor.
     """
-    os.makedirs(log_folder, exist_ok=True)
-    env_raw = PepperArmEnv(**env_kwargs)
-    monitor_path = os.path.join(log_folder, "monitor.csv")
-    return Monitor(env_raw, filename=monitor_path)
+    def _init():
+        os.makedirs(log_folder, exist_ok=True)
+        env_raw = PepperArmEnv(**env_kwargs)
+        monitor_path = os.path.join(log_folder, "monitor.csv")
+        return Monitor(env_raw, filename=monitor_path)
+    return _init
 
 
-def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, base_dir: str):
+def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, n_envs: int, base_dir: str):
     """
     Función objetivo genérica para PPO y SAC.
     """
@@ -135,15 +141,15 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
     alg_folder = os.path.join(base_dir, f"{alg_name}-{trial_id}")
     os.makedirs(alg_folder, exist_ok=True)
     
-    # Logger de SB3
     logger = configure(os.path.join(alg_folder, "tb_logs"), ["stdout", "csv", "tensorboard"])
-    tb_log_path = os.path.join(alg_folder, "tb_logs")
     
-    # Entornos
-    train_env = make_env(seed=trial_id, log_folder=alg_folder, **env_kwargs)
-    eval_env = make_env(seed=trial_id + 1000, log_folder=os.path.join(alg_folder, "eval"), **env_kwargs)
+    train_env = make_vec_env(
+        make_env_fn(log_folder=alg_folder, **env_kwargs),
+        n_envs=n_envs,
+        vec_env_cls=None
+    )
+    eval_env = make_vec_env(make_env_fn(log_folder=os.path.join(alg_folder, "eval"), **env_kwargs), n_envs=1)
     
-    # Callbacks
     curriculum_cb = CurriculumCallback(
         curriculum_params=curriculum_params,
         csv_path=os.path.join(alg_folder, "curriculum_metrics.csv"),
@@ -153,17 +159,15 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
         eval_env,
         best_model_save_path=alg_folder,
         log_path=os.path.join(alg_folder, "eval_logs"),
-        eval_freq=max(5000, total_timesteps // 20),
-        n_eval_episodes=10,
-        deterministic=True
+        eval_freq=max(5000, total_timesteps // (20 * n_envs)),
+        n_eval_episodes=20,
+        deterministic=True,
+        callback_on_new_best=None,
+        warn=False
     )
 
-    # Definir la arquitectura de la política
-    # Usamos una red MLP con 2 capas ocultas de 256 neuronas cada una
-    policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
-
-    # Hiperparámetros y creación del modelo
     if alg_name == "PPO":
+        policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
         params = {
             "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
             "n_steps": trial.suggest_categorical("n_steps", [256, 512, 1024, 2048]),
@@ -172,21 +176,23 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
             "ent_coef": trial.suggest_float("ent_coef", 1e-8, 1e-1, log=True),
             "clip_range": trial.suggest_float("clip_range", 0.1, 0.4),
             "vf_coef": trial.suggest_float("vf_coef", 0.1, 1.0),
-            "batch_size": 64,
+            "batch_size": trial.suggest_categorical("batch_size", [64, 128, 256]),
         }
-        model = PPO("MlpPolicy", train_env, **params, policy_kwargs=policy_kwargs, tensorboard_log=tb_log_path)
-    else:
+        model = PPO("MlpPolicy", train_env, **params, policy_kwargs=policy_kwargs, tensorboard_log=None)
+    
+    else: # SAC
+        policy_kwargs = dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))
         params = {
             "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
             "buffer_size": trial.suggest_categorical("buffer_size", [100_000, 300_000, 1_000_000]),
             "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
             "tau": trial.suggest_float("tau", 0.005, 0.05),
             "gamma": trial.suggest_float("gamma", 0.9, 0.9999),
-            "train_freq": trial.suggest_categorical("train_freq", [1, 4, 8, 16]),
-            "gradient_steps": trial.suggest_categorical("gradient_steps", [1, 4, 8, 16]),
+            "train_freq": (trial.suggest_categorical("train_freq_num", [1, 4, 8, 16]), "step"),
+            "gradient_steps": trial.suggest_categorical("gradient_steps", [-1, 1, 4, 8, 16]),
             "ent_coef": 'auto',
         }
-        model = SAC("MlpPolicy", train_env, **params, policy_kwargs=policy_kwargs, tensorboard_log=tb_log_path)
+        model = SAC("MlpPolicy", train_env, **params, policy_kwargs=policy_kwargs, tensorboard_log=None)
     
     model.set_logger(logger)
     
@@ -200,35 +206,32 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
         print(f"Error durante el entrenamiento en el trial {trial_id}: {e}")
         raise optuna.exceptions.TrialPruned()
 
-    # Guardar modelo final y evaluar
     model.save(os.path.join(alg_folder, "final_model"))
-    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=1000)
+    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=100)
     
-    # Cerrar entornos para liberar recursos de pybullet
     train_env.close()
     eval_env.close()
 
     return mean_reward
 
 
-def evaluate_policy(model, env, n_eval_episodes: int = 10):
+def evaluate_policy(model, env: VecEnv, n_eval_episodes: int = 10):
     """
-    Evalúa la política entrenada en el entorno dado.
+    Evalúa la política entrenada en el entorno vectorizado dado.
     """
     rewards = []
     for _ in range(n_eval_episodes):
-        obs, _ = env.reset()
+        obs = env.reset()
         done = False
         total_r = 0.0
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, r, terminated, truncated, _ = env.step(action)
-            total_r += r
-            done = terminated or truncated
+            obs, r, done, _ = env.step(action)
+            total_r += r[0]
         rewards.append(total_r)
     return np.mean(rewards), np.std(rewards)
 
-def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, n_trials: int):
+def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, n_trials: int, n_envs: int):
     """
     Ejecuta la optimización de hiperparámetros (HPO) para el algoritmo especificado.
     """
@@ -239,35 +242,39 @@ def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_time
         study_name=f"{alg_name}_Study_{datetime.now():%Y%m%d_%H%M%S}"
     )
 
-    func = lambda trial: optimize_agent(trial, alg_name, env_kwargs, curriculum_params, total_timesteps, RESULTS_DIR)
+    func = lambda trial: optimize_agent(trial, alg_name, env_kwargs, curriculum_params, total_timesteps, n_envs, RESULTS_DIR)
     
     try:
-        study.optimize(func, n_trials=n_trials, timeout=3600*24) # 24 horas de timeout
+        study.optimize(func, n_trials=n_trials, timeout=3600*24)
     except KeyboardInterrupt:
         print("HPO interrumpido por el usuario.")
 
-    # Guardar resultados
     df = study.trials_dataframe()
     df.to_csv(os.path.join(RESULTS_DIR, f"{alg_name}_hpo_results.csv"), index=False)
 
     print(f"\n=== HPO {alg_name} completado ===")
-    print("Mejores parámetros:", study.best_params)
-    print(f"Recompensa media objetivo: {study.best_value:.2f}\n")
+    # =========================================================
+    # CORRECCIÓN: Comprobar si existe un 'best_trial' antes de imprimirlo
+    # =========================================================
+    if study.best_trial:
+        print("Mejores parámetros:", study.best_params)
+        print(f"Recompensa media objetivo: {study.best_value:.2f}\n")
+    else:
+        print("No se completó ningún trial exitosamente. No hay mejores parámetros para mostrar.")
 
 
 # =========================================================
 # Punto de entrada principal
 # =========================================================
-# Permite ejecutar el script desde la línea de comandos con argumentos
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Entrenamiento HPO con SB3 para PepperArmEnv")
     parser.add_argument("--alg", choices=["PPO", "SAC"], default="SAC", help="Algoritmo a optimizar")
     parser.add_argument("--timesteps", type=int, default=500_000, help="Timesteps por trial")
     parser.add_argument("--trials", type=int, default=5, help="Trials de HPO")
     parser.add_argument("--side", choices=["Left", "Right"], default="Left", help="Brazo a entrenar")
+    parser.add_argument("--n_envs", type=int, default=4, help="Número de entornos paralelos. Usa el número de núcleos de tu CPU para un rendimiento óptimo.")
     parser.add_argument("--n_samples", type=int, default=8, help="Muestras por dimensión en CSpace")
     parser.add_argument("--max_steps", type=int, default=250, help="Máx. pasos por episodio")
-    # Argumentos del currículo
     parser.add_argument("--start_frac", type=float, default=0.2, help="Frac. inicial del currículo")
     parser.add_argument("--incr_frac", type=float, default=0.1, help="Frac. de incremento del currículo")
     parser.add_argument("--required_succ", type=int, default=5, help="Éxitos consecutivos para subir nivel")
@@ -276,12 +283,10 @@ if __name__ == "__main__":
 
     env_kwargs = {
         "side": args.side,
-        "render_mode": None, # Sin GUI para acelerar el entrenamiento y el estudio HPO
+        "render_mode": None,
         "max_steps": args.max_steps,
         "n_workspace_samples": args.n_samples,
     }
-
-    args = parser.parse_args()
 
     curriculum_params = {
         "start_frac": args.start_frac,
@@ -290,10 +295,11 @@ if __name__ == "__main__":
     }
 
     print(f"\n=== Iniciando HPO para {args.alg} ===")
+    print(f"Usando {args.n_envs} entornos paralelos.")
     print(f"Configuración de entorno: {env_kwargs}")
     print(f"Parámetros de currículo: {curriculum_params}")
     print(f"Timesteps: {args.timesteps}, Trials: {args.trials}\n")
 
-    run_hpo(args.alg, env_kwargs, curriculum_params, args.timesteps, args.trials)
+    run_hpo(args.alg, env_kwargs, curriculum_params, args.timesteps, args.trials, args.n_envs)
 
     print("=== Entrenamiento y HPO completados ===")

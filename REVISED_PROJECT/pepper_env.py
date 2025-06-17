@@ -4,8 +4,7 @@ from gymnasium import spaces
 from gymnasium.utils import seeding
 from qibullet import SimulationManager, PepperVirtual
 
-from scripts.CSpace import generate_workspace_points
-from scripts.robot_graph import LEFT_JOINT_LIMITS, RIGHT_JOINT_LIMITS
+from scripts.CSpace import generate_workspace_points, LEFT_JOINT_LIMITS, RIGHT_JOINT_LIMITS
 
 class PepperArmEnv(gym.Env):
     """
@@ -28,6 +27,7 @@ class PepperArmEnv(gym.Env):
         # =========================================================
         self.render_mode = render_mode
         self.simulation_manager = SimulationManager()
+        # El GUI se activa solo si el modo de render es 'human'
         self.client = self.simulation_manager.launchSimulation(gui=(self.render_mode == 'human'))
         self.pepper = self.simulation_manager.spawnPepper(self.client, spawn_ground_plane=True)
 
@@ -66,7 +66,7 @@ class PepperArmEnv(gym.Env):
         # =========================================================
         # Espacio de trabajo y Configuración del currículo
         # =========================================================
-        # Generación de puntos del espacio de trabajo
+        # Generación de puntos del espacio de trabajo (ahora usa caché)
         points, _ = generate_workspace_points(side=self.side, n_samples=n_workspace_samples)
         self.workspace_points = points.astype(np.float32)
         

@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from qibullet import SimulationManager
 import pybullet as p
 from kinematics.forward import get_arm_joints_positions
+import os # <--- AÑADIDO
 
 # =======================================
 # Parámetros Físicos del Robot
@@ -123,9 +124,22 @@ def calculate_joint_positions(side='Left', joint_angles=None):
 # =======================================
 def generate_workspace_points(side='Left', n_samples=10):
     """
-    Genera puntos del espacio de trabajo para el brazo especificado (izquierdo o derecho).
+    Genera puntos del espacio de trabajo para el brazo especificado.
+    Utiliza un sistema de caché para evitar la regeneración en ejecuciones sucesivas.
     Los puntos se generan en una cuadrícula uniforme dentro de los límites de las articulaciones del brazo.
     """
+    cache_dir = "workspace_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"workspace_{side.lower()}_{n_samples}.npy")
+
+    # Si el archivo de caché existe, cargarlo directamente
+    if os.path.exists(cache_file):
+        print(f"Cargando workspace desde el caché: {cache_file}")
+        points = np.load(cache_file)
+        # Las configuraciones no se guardan en caché para ahorrar espacio. Se devuelve una lista vacía.
+        return points, []
+
+    print(f"Generando puntos del workspace para '{side}' con n_samples={n_samples}. Esto puede tardar...")
     limits = LEFT_JOINT_LIMITS if side == 'Left' else RIGHT_JOINT_LIMITS
     prefix = 'L' if side == 'Left' else 'R'
     # Consultar los límites de las articulaciones
@@ -149,7 +163,13 @@ def generate_workspace_points(side='Left', n_samples=10):
                         end_effector = positions[-1]
                         points.append(end_effector)
                         configurations.append(angles)
-    return np.array(points), configurations
+
+    points_np = np.array(points)
+    # Guardar los puntos generados en el caché
+    print(f"Guardando {len(points_np)} puntos del workspace en: {cache_file}")
+    np.save(cache_file, points_np)
+    
+    return points_np, configurations
 
 
 def plot_workspace_qibullet():
@@ -157,7 +177,7 @@ def plot_workspace_qibullet():
     Visualiza el espacio de trabajo en una simulación de qiBullet.
     Genera puntos del workspace para ambos brazos y los dibuja en la simulación.
     """
-    print("Generando puntos del workspace para visualización en qiBullet (puede tardar)...")
+    print("Generando puntos del workspace para visualización en qiBullet (usará caché si está disponible)...")
     left_points, _ = generate_workspace_points('Left', n_samples=4)
     right_points, _ = generate_workspace_points('Right', n_samples=4)
 
