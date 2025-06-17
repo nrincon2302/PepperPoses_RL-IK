@@ -1,32 +1,22 @@
-# --- START OF FILE evaluate_model.py ---
-# --- MODIFICADO ---
-
 import os
 import time
 import argparse
 import numpy as np
 import pybullet as p
-
 from stable_baselines3 import PPO, SAC
 from pepper_env import PepperArmEnv
-from scripts.CSpace import generate_workspace_points
-
 import matplotlib.pyplot as plt
 
-
-def obtener_targets(base_dir, n_tests, side, semilla=0):
+def obtener_targets(base_dir, n_tests, side, semilla=42):
+    # Cargar targets desde el caché del workspace para consistencia
+    cache_path = os.path.join("workspace_cache", f"workspace_{side.lower()}_8.npy")
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError("Ejecuta 'generate_workspace_cache.py' primero.")
+    
+    workspace_points = np.load(cache_path)
     np.random.seed(semilla)
-    ruta = os.path.join(base_dir, f"test_targets_{side}.npy")
-    if os.path.exists(ruta):
-        return np.load(ruta)
-    else:
-        # Asegurarse de que el directorio existe
-        os.makedirs(base_dir, exist_ok=True)
-        espacio, _ = generate_workspace_points(side=side, n_samples=8)
-        idxs = np.random.choice(len(espacio), size=n_tests, replace=False)
-        targets = espacio[idxs]
-        np.save(ruta, targets)
-        return targets
+    idxs = np.random.choice(len(workspace_points), size=n_tests, replace=False)
+    return workspace_points[idxs]
 
 def evaluar(modelo_folder: str, targets: np.ndarray, side: str, show_gui: bool):
     base = "resultados_calibracion"
@@ -34,98 +24,61 @@ def evaluar(modelo_folder: str, targets: np.ndarray, side: str, show_gui: bool):
     ruta_modelo = os.path.join(carpeta, "best_model.zip")
     if not os.path.exists(ruta_modelo):
         ruta_modelo = os.path.join(carpeta, "final_model.zip")
+        if not os.path.exists(ruta_modelo):
+            raise FileNotFoundError(f"No se encontró el modelo en {carpeta}")
     
     alg = modelo_folder.split("-")[0].upper()
     agente = PPO.load(ruta_modelo) if alg == "PPO" else SAC.load(ruta_modelo)
-
-    # Crear entorno
     env = PepperArmEnv(side=side, render_mode="human" if show_gui else None)
     
-    target_vis_id = -1
-    errores, tiempos, exitos = [], [], 0
-    
+    all_results = []
     print(f"\n=== Evaluación de {modelo_folder} ({alg}) ===")
     for i, tgt in enumerate(targets):
-        if show_gui and target_vis_id != -1:
-            p.removeBody(target_vis_id, physicsClientId=env.client)
-
         if show_gui:
-            visual_shape_id = p.createVisualShape(
-                shapeType=p.GEOM_SPHERE,
-                radius=0.05,
-                rgbaColor=[1, 0, 0, 0.8],
-                physicsClientId=env.client
-            )
-            target_vis_id = p.createMultiBody(
-                baseMass=0,
-                baseVisualShapeIndex=visual_shape_id,
-                basePosition=tgt.tolist(),
-                physicsClientId=env.client
-            )
-            
-            print(f"Prueba {i+1}/{len(targets)}. Target: {tgt}. Presiona Enter para continuar...")
+            print(f"Prueba {i+1}/{len(targets)}. Target: {tgt.round(3)}. Presiona Enter...")
             input()
 
         obs, info = env.reset(options={"target_pos": tgt})
-        
-        # El estado inicial ya incluye los ángulos
         angles_history = [info['joint_angles'].copy()]
-
-        done, total_steps = False, 0
-        t0 = time.time()
+        done = False
         
         while not done:
             action, _ = agente.predict(obs, deterministic=True)
             obs, _, terminated, truncated, info = env.step(action)
             angles_history.append(info['joint_angles'].copy())
             done = terminated or truncated
-            total_steps += 1
-            if show_gui:
-                time.sleep(1/30)
-
-        err = info["distance"]
-        errores.append(err)
-        tiempos.append(time.time() - t0)
-        if info['is_success']:
-            exitos += 1
+            if show_gui: time.sleep(1.0 / env.control_frequency)
         
-        print(f"  Resultado: Error final={err:.4f} m, Pasos={total_steps}, Éxito={info['is_success']}")
-        print("  Ángulos finales:", info['joint_angles'])
-
-        # Crear la gráfica
-        plt.figure(figsize=(10, 6))
-        for name in env.joint_keys:
-            plt.plot(angles_history, label=name)
-        
-        plt.title(f"Evolución de Ángulos - {modelo_folder} (Última Prueba)")
-        plt.xlabel("Paso de tiempo")
-        plt.ylabel("Ángulo [rad]")
-        plt.grid(True)
-        plt.legend([f"{side[0]}ShoulderPitch", f"{side[0]}ShoulderRoll", f"{side[0]}ElbowYaw", f"{side[0]}ElbowRoll", f"{side[0]}WristYaw", f"{side[0]}WristRoll"])
-        plt.tight_layout()
-        plt.show() # Mostrar la gráfica al final
+        all_results.append({'distance': info["distance"], 'is_success': info['is_success'], 'angles_history': np.array(angles_history)})
+        print(f"  Resultado: Error final={info['distance']:.4f} m, Éxito={info['is_success']}")
 
     env.close()
 
     # Estadísticas
-    err_arr = np.array(errores)
-    time_arr = np.array(tiempos)
+    success_rate = np.mean([res['is_success'] for res in all_results]) * 100
+    avg_error = np.mean([res['distance'] for res in all_results])
     print(f"\n--- Resumen de {modelo_folder} ---")
-    print(f"Pruebas totales     : {len(targets)}")
-    print(f"Éxitos (≤{env.goal_threshold:.2f} m)    : {exitos} ({exitos/len(targets)*100:.1f} %)")
-    print(f"Error promedio      : {err_arr.mean():.4f} m ± {err_arr.std():.4f}")
-    print(f"Tiempo promedio/ep  : {time_arr.mean():.3f} s ± {time_arr.std():.3f}\n")
+    print(f"Tasa de éxito ({env.goal_threshold*100:.1f} cm): {success_rate:.1f} %")
+    print(f"Error promedio      : {avg_error:.4f} m")
+
+    # Gráfica de la última prueba
+    last_history = all_results[-1]['angles_history']
+    plt.figure(figsize=(10, 6))
+    for i, name in enumerate(env.joint_keys):
+        plt.plot(last_history[:, i], label=name)
+    
+    plt.title(f"Evolución de Ángulos - {modelo_folder} (Última Prueba)")
+    plt.xlabel("Paso de tiempo"); plt.ylabel("Ángulo [rad]")
+    plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluar modelos entrenados")
-    parser.add_argument("--models", nargs="+", required=True, help="Lista de carpetas de modelos (ej: SAC-0 PPO-1)")
-    parser.add_argument("--side", choices=["Left", "Right"], default="Left", help="Brazo a evaluar")
-    parser.add_argument("--n_tests", type=int, default=10, help="Cantidad de targets a probar")
-    parser.add_argument("--seed", type=int, default=42, help="Semilla para generar banco de pruebas")
-    parser.add_argument("--no-gui", action="store_true", help="Ejecutar evaluación sin GUI")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--models", nargs="+", required=True, help="Carpetas de modelos (ej: SAC-0)")
+    parser.add_argument("--side", choices=["Left", "Right"], default="Left")
+    parser.add_argument("--n_tests", type=int, default=20)
+    parser.add_argument("--no-gui", action="store_true")
     args = parser.parse_args()
 
-    banco_pruebas = obtener_targets("resultados_calibracion", args.n_tests, args.side, semilla=args.seed)
-    
+    banco_pruebas = obtener_targets("resultados_calibracion", args.n_tests, args.side)
     for modelo in args.models:
         evaluar(modelo, banco_pruebas, args.side, not args.no_gui)

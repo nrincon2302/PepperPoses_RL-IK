@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# coding: utf-8
+# File taken from QiBullet repository for testing and comparison
 
 import sys
 import time

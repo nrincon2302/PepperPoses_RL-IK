@@ -1,6 +1,3 @@
-# --- START OF FILE train_pepper.py ---
-# --- MODIFICADO ---
-
 import os
 import argparse
 from datetime import datetime
@@ -18,6 +15,7 @@ from stable_baselines3.common.logger import configure
 from pepper_env import PepperArmEnv
 
 RESULTS_DIR = "resultados_calibracion"
+
 
 class CurriculumCallback(BaseCallback):
     """
@@ -47,8 +45,11 @@ class CurriculumCallback(BaseCallback):
                 "curriculum_radius", "consecutive_successes"
             ]).to_csv(self.csv_path, index=False)
 
+
     def _on_training_start(self) -> None:
-        """Inicializa los parámetros del currículo usando el entorno."""
+        """
+        Inicializa los parámetros del currículo usando el entorno.
+        """
         if not self.initialized:
             env = self.training_env.envs[0].env # Acceder al entorno base
             self.max_radius = env.max_workspace_radius
@@ -56,36 +57,46 @@ class CurriculumCallback(BaseCallback):
             self.increment = self.increment_frac * self.max_radius
             env.set_curriculum_radius(self.current_radius)
             self.initialized = True
+            # Escritura en consola del entrenamiento inicializado
             if self.verbose > 0:
-                print("--- Curriculum Callback Initialized ---")
-                print(f"Max Radius: {self.max_radius:.3f} m")
-                print(f"Start Radius: {self.current_radius:.3f} m")
-                print(f"Increment: {self.increment:.3f} m")
+                print("--- Callback del Curriculum iniciado ---")
+                print(f"Radio máximo: {self.max_radius:.3f} m")
+                print(f"Radio Inicial: {self.current_radius:.3f} m")
+                print(f"Incremento en el Radio: {self.increment:.3f} m")
                 print("---------------------------------------")
 
     def _on_step(self) -> bool:
-        # Se ejecuta al final de cada episodio gracias a Monitor
+        """
+        Lógica del currículo después de cada paso.
+        Actualiza el radio del currículo y registra métricas.
+        """
         for i, done in enumerate(self.locals["dones"]):
             if done:
                 self.episode_count += 1
                 info = self.locals["infos"][i]
                 
-                # --- Lógica de actualización del currículo ---
+                # ===============================================
+                # Actualización del currículo
+                # ===============================================
+                # Contar la cantidad de éxitos consecutivos
                 if info.get("is_success", False):
                     self.consecutive_successes += 1
                 else:
                     self.consecutive_successes = 0
                 
+                # Si se alcanzó el número requerido de éxitos, aumentar el radio
                 if self.consecutive_successes >= self.required_successes:
                     self.current_radius = min(self.current_radius + self.increment, self.max_radius)
-                    self.consecutive_successes = 0 # Resetear
+                    self.consecutive_successes = 0 # Resetear a cero
                     if self.verbose > 0:
                         print(f"\n[Curriculum] Nivel aumentado! Nuevo radio: {self.current_radius:.3f} m\n")
 
                 # Actualizar el radio en el entorno para el próximo reset
                 self.training_env.env_method("set_curriculum_radius", self.current_radius)
 
-                # --- Lógica de logging ---
+                # ===============================================
+                # Registro de métricas
+                # ===============================================
                 if "episode" in info:
                     epi_info = info["episode"]
                     log_data = {
@@ -107,16 +118,19 @@ class CurriculumCallback(BaseCallback):
         return True
 
 def make_env(seed: int, log_folder: str, **env_kwargs):
+    """
+    Crea un entorno PepperArmEnv con monitorización y logging.
+    """
     os.makedirs(log_folder, exist_ok=True)
-    # El render_mode='human' debe pasarse aquí
     env_raw = PepperArmEnv(**env_kwargs)
-    # La nueva API de Gymnasium usa reset(seed=...) en lugar de env.seed()
-    # Monitor se encargará de esto si se pasa la semilla al reset del modelo
     monitor_path = os.path.join(log_folder, "monitor.csv")
     return Monitor(env_raw, filename=monitor_path)
 
+
 def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, base_dir: str):
-    """Función objetivo genérica para PPO y SAC."""
+    """
+    Función objetivo genérica para PPO y SAC.
+    """
     trial_id = trial.number
     alg_folder = os.path.join(base_dir, f"{alg_name}-{trial_id}")
     os.makedirs(alg_folder, exist_ok=True)
@@ -144,6 +158,8 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
         deterministic=True
     )
 
+    # Definir la arquitectura de la política
+    # Usamos una red MLP con 2 capas ocultas de 256 neuronas cada una
     policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
 
     # Hiperparámetros y creación del modelo
@@ -159,7 +175,7 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
             "batch_size": 64,
         }
         model = PPO("MlpPolicy", train_env, **params, policy_kwargs=policy_kwargs, tensorboard_log=tb_log_path)
-    else: # SAC
+    else:
         params = {
             "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
             "buffer_size": trial.suggest_categorical("buffer_size", [100_000, 300_000, 1_000_000]),
@@ -182,12 +198,11 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
         )
     except Exception as e:
         print(f"Error durante el entrenamiento en el trial {trial_id}: {e}")
-        # Optuna manejará esto como un trial fallido
         raise optuna.exceptions.TrialPruned()
 
     # Guardar modelo final y evaluar
     model.save(os.path.join(alg_folder, "final_model"))
-    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=20)
+    mean_reward, _ = evaluate_policy(model, eval_env, n_eval_episodes=1000)
     
     # Cerrar entornos para liberar recursos de pybullet
     train_env.close()
@@ -195,8 +210,11 @@ def optimize_agent(trial: optuna.Trial, alg_name: str, env_kwargs: dict, curricu
 
     return mean_reward
 
-# Copiado de evaluate_model.py para usar aquí
+
 def evaluate_policy(model, env, n_eval_episodes: int = 10):
+    """
+    Evalúa la política entrenada en el entorno dado.
+    """
     rewards = []
     for _ in range(n_eval_episodes):
         obs, _ = env.reset()
@@ -211,6 +229,9 @@ def evaluate_policy(model, env, n_eval_episodes: int = 10):
     return np.mean(rewards), np.std(rewards)
 
 def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_timesteps: int, n_trials: int):
+    """
+    Ejecuta la optimización de hiperparámetros (HPO) para el algoritmo especificado.
+    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     study = optuna.create_study(
         sampler=TPESampler(seed=42),
@@ -221,7 +242,7 @@ def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_time
     func = lambda trial: optimize_agent(trial, alg_name, env_kwargs, curriculum_params, total_timesteps, RESULTS_DIR)
     
     try:
-        study.optimize(func, n_trials=n_trials, timeout=3600*8) # 8 horas de timeout
+        study.optimize(func, n_trials=n_trials, timeout=3600*24) # 24 horas de timeout
     except KeyboardInterrupt:
         print("HPO interrumpido por el usuario.")
 
@@ -233,11 +254,16 @@ def run_hpo(alg_name: str, env_kwargs: dict, curriculum_params: dict, total_time
     print("Mejores parámetros:", study.best_params)
     print(f"Recompensa media objetivo: {study.best_value:.2f}\n")
 
+
+# =========================================================
+# Punto de entrada principal
+# =========================================================
+# Permite ejecutar el script desde la línea de comandos con argumentos
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Entrenamiento HPO con SB3 para PepperArmEnv")
     parser.add_argument("--alg", choices=["PPO", "SAC"], default="SAC", help="Algoritmo a optimizar")
-    parser.add_argument("--timesteps", type=int, default=100_000, help="Timesteps por trial")
-    parser.add_argument("--trials", type=int, default=10, help="Trials de HPO")
+    parser.add_argument("--timesteps", type=int, default=500_000, help="Timesteps por trial")
+    parser.add_argument("--trials", type=int, default=5, help="Trials de HPO")
     parser.add_argument("--side", choices=["Left", "Right"], default="Left", help="Brazo a entrenar")
     parser.add_argument("--n_samples", type=int, default=8, help="Muestras por dimensión en CSpace")
     parser.add_argument("--max_steps", type=int, default=250, help="Máx. pasos por episodio")
@@ -250,7 +276,7 @@ if __name__ == "__main__":
 
     env_kwargs = {
         "side": args.side,
-        "render_mode": None, # Sin GUI para HPO
+        "render_mode": None, # Sin GUI para acelerar el entrenamiento y el estudio HPO
         "max_steps": args.max_steps,
         "n_workspace_samples": args.n_samples,
     }

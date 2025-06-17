@@ -29,5 +29,6 @@ def inspect_robot():
     print("-" * 50)
     print("Inspección completa.")
 
+
 if __name__ == "__main__":
     inspect_robot()
