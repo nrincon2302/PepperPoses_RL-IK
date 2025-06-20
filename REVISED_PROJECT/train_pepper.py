@@ -15,8 +15,8 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecEnv, DummyVecEnv
 
 # Importamos ambos tipos de entorno para poder elegirlos dinámicamente
-from pepper_env import PepperArmEnv
-from pepper_analytical_env import PepperAnalyticalEnv
+from environments.pepper_env import PepperArmEnv
+from environments.pepper_analytical_env import PepperAnalyticalEnv
 
 RESULTS_DIR = "resultados_calibracion"
 

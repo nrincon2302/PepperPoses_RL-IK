@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from qibullet import SimulationManager
 import pybullet as p
 from kinematics.forward import get_arm_joints_positions
-import os # <--- AÑADIDO
+import os
 
 # =======================================
 # Parámetros Físicos del Robot

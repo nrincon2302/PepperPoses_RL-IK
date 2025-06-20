@@ -5,7 +5,7 @@ import numpy as np
 import pybullet as p
 
 from stable_baselines3 import PPO, SAC
-from pepper_env import PepperArmEnv
+from environments.pepper_env import PepperArmEnv
 from scripts.CSpace import generate_workspace_points
 
 
