@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: pepper_rl_ik
-Version: 0.1
-Requires-Dist: gymnasium
-Requires-Dist: stable-baselines3
-Requires-Dist: matplotlib
-Requires-Dist: pandas
-Requires-Dist: scipy
-Dynamic: requires-dist
