@@ -54,7 +54,7 @@ class PepperArmEnv(gym.Env):
 
         # Máxima cantidad de pasos por episodio y umbral de éxito (error en centímetros convertido a metros)
         self.max_steps = max_steps
-        self.goal_threshold = 0.015
+        self.goal_threshold = 0.10
         
         # Estado de un episodio
         self.current_step = 0
@@ -118,7 +118,7 @@ class PepperArmEnv(gym.Env):
         # Recompensa debido a mejoramiento en la distancia
         improvement = (prev_distance - distance) * 30.0
         # Penalización por falta de proximidad al objetivo
-        proximity = -5.0 * distance
+        proximity = -2.0 * distance
         # Penalización por acción brusca (movimiento poco suave de los joints)
         smoothness = -0.15 * np.sum(np.square(action))
         # Penalización por alcanzar los límites de los joints o moverse fuera de estos
