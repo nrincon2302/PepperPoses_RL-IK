@@ -24,7 +24,7 @@ def obtener_targets(base_dir, n_tests, side, semilla=0):
         return targets
 
 def evaluar(modelo_folder: str, targets: np.ndarray, side: str, show_gui: bool):
-    base = "resultados_calibracion"
+    base = f"resultados_{side}"
     carpeta = os.path.join(base, modelo_folder)
     ruta_modelo = os.path.join(carpeta, "best_model.zip")
     if not os.path.exists(ruta_modelo):
