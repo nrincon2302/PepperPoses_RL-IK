@@ -101,7 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-gui", action="store_true", help="Ejecutar evaluación sin GUI")
     args = parser.parse_args()
 
-    banco_pruebas = obtener_targets("resultados_calibracion", args.n_tests, args.side, semilla=args.seed)
+    banco_pruebas = obtener_targets(f"resultados_{args.side}", args.n_tests, args.side, semilla=args.seed)
     
     for modelo in args.models:
         evaluar(modelo, banco_pruebas, args.side, not args.no_gui)
