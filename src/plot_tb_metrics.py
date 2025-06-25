@@ -1,86 +1,63 @@
 import os
-import argparse
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from tensorboard.backend.event_processing import event_accumulator
 import matplotlib.pyplot as plt
 
-"""
-Script para cargar y graficar métricas de TensorBoard usando matplotlib.
-Eje X: pasos * 10
-Métricas:
-  - curriculum/radius
-  - rollout/ep_rew_mean
-  - rollout/success_rate
-  - train/value_loss
-  - train/policy_gradient_loss
+# Configuración de directorios
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+SIDES = ["Left", "Right"]
+ALGOS = ["PPO", "SAC"]
+RUNS = range(4)  # 0,1,2,3
 
-Uso:
-  python plot_tb_metrics.py --logdir resultados_calibracion/PPO-0/tb_logs --outdir plots
-"""
+# Métricas a graficar: tag en TensorBoard y título
+METRICS = [
+    ("curriculum/radius", "Radio de Currículo", "curriculum_radius.png"),
+    ("rollout/ep_rew_mean", "Recompensa Media en entrenamiento", "ep_rew_mean.png"),
+    ("rollout/success_rate", "Tasa de Éxito Promedio en Ventana de 100 episodios", "success_rate.png")
+]
 
-def load_scalars(logdir, tags):
-    # Buscar primer archivo de eventos en el directorio
-    event_files = [os.path.join(logdir, f) for f in os.listdir(logdir) if f.startswith('events')]
-    if not event_files:
-        raise FileNotFoundError(f"No se encontraron archivos de eventos en {logdir}")
-    ea = EventAccumulator(event_files[0], size_guidance={'scalars': 0})
-    ea.Reload()
-    data = {}
-    for tag in tags:
-        try:
-            events = ea.Scalars(tag)
-            steps = [e.step * 10 for e in events]
-            values = [e.value for e in events]
-            data[tag] = (steps, values)
-        except KeyError:
-            print(f"Etiqueta '{tag}' no encontrada en los eventos.")
-    return data
+# Carpeta de salida
+GRAPHS_DIR = os.path.join(SRC_DIR, "graphs")
 
-def plot_metrics(data, outdir):
-    os.makedirs(outdir, exist_ok=True)
-    for tag, (steps, values) in data.items():
-        plt.figure()
-        plt.plot(steps, values)
-        plt.xlabel('Timesteps')
-        if tag == 'curriculum/radius':
-            plt.ylabel('Radio del Curriculum (m)')
-            plt.title('Radio del Curriculum a lo largo del tiempo')
-        elif tag == 'rollout/ep_rew_mean':
-            plt.ylabel('Recompensa Media por Episodio')
-            plt.title('Recompensa Media por Episodio a lo largo del tiempo')
-        elif tag == 'rollout/success_rate':
-            plt.ylabel('Tasa de Éxito')
-            plt.title('Tasa de Éxito a lo largo del tiempo')
-        elif tag == 'train/value_loss':
-            plt.ylabel('Pérdida de Valor')
-            plt.title('Pérdida de Valor a lo largo del tiempo')
-        elif tag == 'train/policy_gradient_loss':
-            plt.ylabel('Pérdida de Gradiente de Política')
-            plt.title('Pérdida de Gradiente de Política a lo largo del tiempo')
-        else:
-            plt.ylabel('Valor')
-            plt.title(f'Métrica {tag} a lo largo del tiempo')
-        plt.grid(True)
-        filename = tag.replace('/', '_') + '.png'
-        plt.savefig(os.path.join(outdir, filename))
-        plt.close()
-        print(f"Guardado: {filename}")
+if __name__ == "__main__":
+    for algo in ALGOS:
+        for side in SIDES:
+            # Crear carpetas de salida
+            out_base = os.path.join(GRAPHS_DIR, algo, side)
+            os.makedirs(out_base, exist_ok=True)
 
-def main():
-    parser = argparse.ArgumentParser(description='Graficar métricas de TensorBoard con matplotlib')
-    parser.add_argument('--logdir', type=str, required=True, help='Directorio de tb_logs')
-    parser.add_argument('--outdir', type=str, default='plots', help='Directorio de salida para las gráficas')
-    args = parser.parse_args()
+            # Recolectar datos para cada corrida
+            data = {}
+            for run in RUNS:
+                run_name = f"{algo}-analytical-{run}"
+                log_dir = os.path.join(SRC_DIR, f"resultados_{side}", run_name, "tb_logs")
+                if not os.path.isdir(log_dir):
+                    print(f"Directorio no encontrado: {log_dir}")
+                    continue
+                ea = event_accumulator.EventAccumulator(log_dir)
+                ea.Reload()
+                # Para cada métrica, extraer pasos y valores
+                for tag, _, _ in METRICS:
+                    if tag not in data:
+                        data[tag] = {}
+                    try:
+                        events = ea.Scalars(tag)
+                        steps = [e.step for e in events]
+                        vals  = [e.value for e in events]
+                        data[tag][run_name] = (steps, vals)
+                    except KeyError:
+                        print(f"Tag no encontrado {tag} en {run_name}")
 
-    tags = [
-        'curriculum/radius',
-        'rollout/ep_rew_mean',
-        'rollout/success_rate',
-        'train/value_loss',
-        'train/policy_gradient_loss',
-    ]
-
-    data = load_scalars(args.logdir, tags)
-    plot_metrics(data, args.outdir)
-
-if __name__ == '__main__':
-    main()
+            # Generar gráficas comparativas
+            for tag, title, filename in METRICS:
+                plt.figure()
+                for run_name, (steps, vals) in sorted(data[tag].items()):
+                    plt.plot(steps, vals, label=run_name)
+                plt.title(title)
+                plt.xlabel("Paso")
+                plt.ylabel(title)
+                plt.legend()
+                plt.grid(True)
+                out_path = os.path.join(out_base, filename)
+                plt.savefig(out_path)
+                plt.close()
+                print(f"Guardado: {out_path}")
