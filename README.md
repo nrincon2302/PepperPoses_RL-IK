@@ -91,3 +91,21 @@ Este repositorio contiene todo el código, datos y documentación asociados al p
    ```bash
    python scripts/run_tests.py --model-path modelos/PPO-analytical-3.zip --side Left --thresholds 0.10 0.075 0.05
    ```
+
+---
+
+## Tecnologías Utilizadas
+
+A continuación se listan las referencias de las principales librerías y frameworks utilizados en este proyecto:
+
+- **Stable-Baselines3**  
+  Raffin, A., Hill, A., Gleave, A., Kanervisto, A., Ernestus, M. & Dormann, N. (2021). *Stable-Baselines3: Reliable Reinforcement Learning Implementations*. Journal of Machine Learning Research, 22(268), 1–8.  
+
+- **Optuna**  
+  Akiba, T., Sano, S., Yanase, T., Ohta, T. & Koyama, M. (2019). *Optuna: A Next-generation Hyperparameter Optimization Framework*. En Proceedings of the 25th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining.
+
+- **qiBullet**  
+  Busy, M. & Caniot, M. (2019). *qiBullet, a Bullet-based simulator for the Pepper and NAO robots*. arXiv preprint arXiv:1909.00779.
+
+- **Gymnasium**  
+  Towers, M., Kwiatkowski, A., Terry, J., Balis, J. U., De Cola, G., Deleu, T., Goulão, M., Kallinteris, A., Krimmel, M., KG, A., Perez-Vicente, R., Pierré, A., Schulhoff, S., Tai, J. J., Tan, H. & Younis, O. G. (2024). *Gymnasium: A Standard Interface for Reinforcement Learning Environments*. arXiv:2407.17032.
