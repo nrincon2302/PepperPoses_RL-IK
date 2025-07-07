@@ -1,0 +1,92 @@
+\documentclass[spanish,10pt,letterpaper,onecolumn]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{amsmath}
+\usepackage{babel}
+\usepackage[left=2.50cm, right=2.50cm, top=2.50cm, bottom=2.50cm]{geometry}
+\usepackage{titlesec}
+\usepackage{lipsum}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc, decorations.markings}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\addto\captionsspanish{\renewcommand{\tablename}{Tabla}}
+\captionsetup[figure]{labelfont=bf, textfont=normalfont}
+\captionsetup[table]{labelfont=bf, textfont=normalfont}
+\usepackage[backend=biber,style=apa]{biblatex}
+\DeclareLanguageMapping{spanish}{spanish-apa}
+\addbibresource{references.bib}
+
+\begin{document}
+	
+	% Portada personalizada
+	\begin{titlepage}
+		\centering
+		\vspace*{2cm}
+		
+		\includegraphics[width=250pt]{images/logo-uniandes.png}\par\vspace{2cm}
+		
+		{\Huge\bfseries Aproximación de la cinemática inversa de los brazos de un robot Pepper mediante aprendizaje por refuerzo\par}
+		\vspace{2cm}
+		
+		{\Large \textbf{Autor}\\ Nicolás Rincón Sánchez\par}
+		\vspace{0.5cm}
+		{\Large \textbf{Director}\\ Fernando Enrique Lozano Martínez\par}
+		\vspace{0.5cm}
+		{\Large \textbf{Jurado}\\ Johann F. Osma Cruz\par}
+		
+		\vfill
+		
+		{\Large
+			Universidad de los Andes\\
+			Facultad de Ingeniería\\
+			Departamento de Ingeniería Eléctrica y Electrónica\\
+			Bogotá D.C., Colombia\\
+			Julio de 2025
+		}
+	\end{titlepage}
+
+	% Resumen después de página de respeto
+	\newpage
+	\thispagestyle{empty}
+	\input{sections/0Resumen}
+	
+	\newpage
+	\setcounter{page}{1} 
+	
+	% Tabla de contenido
+	\renewcommand{\contentsname}{Tabla de contenido}
+	\tableofcontents
+	\newpage
+	
+	% Contenido
+	\input{sections/1Introduccion}
+	
+	\input{sections/2Objetivos}
+	
+	\input{sections/3Problematica}
+	
+	\input{sections/4MarcoTeorico}
+	
+	\input{sections/5Metodologia}
+	
+	\input{sections/6TrabajoRealizado}
+	
+	\input{sections/7Validacion}
+	
+	\input{sections/8Conclusiones}
+	
+	% Bibliografía
+	\newpage
+	\printbibliography
+	
+\end{document}
